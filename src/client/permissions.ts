@@ -1,5 +1,5 @@
 import { session } from '@kernhq/ui'
-import { inventoryPermissions, MODULE_ID } from '../contract.js'
+import { inventoryPermissions, MODULE_ID } from '../contract/index.js'
 
 /**
  * What this module lets somebody do.

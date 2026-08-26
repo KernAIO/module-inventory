@@ -1,5 +1,5 @@
 {
-  "id": "50998845-5c27-429f-ba8d-b7beda4579b4",
+  "id": "33173d81-879e-409b-a7c7-d8f9977b9e6c",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -139,8 +139,7 @@
         },
         "status": {
           "name": "status",
-          "type": "asset_status",
-          "typeSchema": "public",
+          "type": "text",
           "primaryKey": false,
           "notNull": true,
           "default": "'in_stock'"
@@ -204,6 +203,13 @@
           "type": "uuid",
           "primaryKey": false,
           "notNull": false
+        },
+        "custom": {
+          "name": "custom",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
         },
         "created_at": {
           "name": "created_at",
@@ -307,6 +313,28 @@
             }
           ],
           "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "inventory_assets_ws_custodian_idx": {
+          "name": "inventory_assets_ws_custodian_idx",
+          "columns": [
+            {
+              "expression": "workspace_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "custodian_user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "custodian_user_id is not null",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -568,13 +596,13 @@
         "workspace_id": {
           "name": "workspace_id",
           "type": "uuid",
-          "primaryKey": true,
+          "primaryKey": false,
           "notNull": true
         },
         "key": {
           "name": "key",
           "type": "text",
-          "primaryKey": true,
+          "primaryKey": false,
           "notNull": true
         },
         "value": {
@@ -586,7 +614,12 @@
       },
       "indexes": {},
       "foreignKeys": {},
-      "compositePrimaryKeys": {},
+      "compositePrimaryKeys": {
+        "counters_workspace_id_key_pk": {
+          "name": "counters_workspace_id_key_pk",
+          "columns": ["workspace_id", "key"]
+        }
+      },
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
@@ -972,13 +1005,7 @@
       "isRLSEnabled": false
     }
   },
-  "enums": {
-    "public.asset_status": {
-      "name": "asset_status",
-      "schema": "public",
-      "values": ["in_stock", "assigned", "under_repair", "retired"]
-    }
-  },
+  "enums": {},
   "schemas": {
     "mod_inventory": "mod_inventory"
   },

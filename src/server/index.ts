@@ -1,7 +1,14 @@
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { inventoryContract, inventoryEvents, inventoryPermissions, MODULE_ID } from '../contract.js'
-import { defineModule, defineServerModule, implement_, packageVersion } from './_impl.js'
+import {
+  InventorySettings,
+  inventoryCapabilities,
+  inventoryContract,
+  inventoryEvents,
+  inventoryPermissions,
+  MODULE_ID,
+} from '../contract/index.js'
+import { defineModule, defineServerModule, inventoryRouter, packageVersion } from './router.js'
 import { schema } from './schema.js'
 
 export const inventoryModule = defineServerModule({
@@ -10,24 +17,20 @@ export const inventoryModule = defineServerModule({
     name: 'Inventory',
     version: packageVersion(import.meta.url),
     description:
-      'The asset register: what the company owns, who holds each item, and everything that happened to it',
+      'The asset register: what the company owns, item by item — tags, serial numbers, purchase and warranty details',
     icon: 'briefcase',
     permissions: inventoryPermissions,
+    capabilities: inventoryCapabilities,
     events: inventoryEvents,
+    settings: InventorySettings,
+    // `objectTypes` returns with the resolver that turns a mention or a link into an asset and the
+    // indexer that puts one in search — declaring the type with neither made both resolve to
+    // nothing, which reads to a user as a broken link rather than as a feature not built yet.
   }),
   /** Attached so the developer panel can check the router against what was promised. */
   contract: inventoryContract,
   schema,
   migrationsFolder: join(dirname(fileURLToPath(import.meta.url)), '../../migrations'),
-  router: implement_,
-  /**
-   * What this module reacts to. The pattern may be an exact name, `module.*`, or `*`; handlers are
-   * durable consumers in production, so one that throws is retried rather than lost.
-   */
-  subscriptions: {
-    'core.workspace.created': async (event, kernel) => {
-      kernel.log.info({ module: MODULE_ID, event: event.name }, 'a workspace was created')
-    },
-  },
+  router: inventoryRouter,
 })
 export default inventoryModule

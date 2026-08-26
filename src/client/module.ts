@@ -89,8 +89,28 @@ export const inventoryClientModule = defineClientModule({
     },
   ],
 
-  /** A settings page's `id` is its URL: the shell mounts it at `/<ws>/settings/inventory/<id>`. */
-  settingsPages: [],
+  /**
+   * A settings page's `id` is its URL: the shell mounts it at `/<ws>/settings/inventory/<id>`.
+   *
+   * This was `[]` while the server enforced `assetCodePrefix` and `assetCodePad` on every asset it
+   * created — two settings nobody, at any permission level, could change. `core.modules.manage`
+   * rather than an inventory permission, because that is what core gates
+   * `workspaces.modules.updateSettings` on: offering the page on a wider permission shows somebody
+   * a form the server then refuses on save.
+   */
+  settingsPages: [
+    {
+      id: 'general',
+      get label() {
+        return t('settings_general')
+      },
+      icon: 'sliders-vertical',
+      scope: 'workspace',
+      permission: 'core.modules.manage',
+      order: 1,
+      component: () => import('./settings/GeneralSettings.svelte'),
+    },
+  ],
 })
 
 export default inventoryClientModule

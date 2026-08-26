@@ -3,20 +3,31 @@ import {
   Badge,
   type BadgeTone,
   Button,
+  Dialog,
+  DropdownMenu,
   EmptyState,
+  IconButton,
   Input,
+  type MenuItem,
+  Page,
+  PageHeader,
   Select,
   type SelectOption,
   Skeleton,
-  Spinner,
-  StatTile,
+  Switch,
   session,
+  Table,
+  TableCell,
+  TableHeader,
+  TableRow,
+  toast,
 } from '@kernhq/ui'
-import { createQuery } from '@tanstack/svelte-query'
+import { createInfiniteQuery, createMutation, useQueryClient } from '@tanstack/svelte-query'
+import type { Asset, AssetStatus } from '../../contract/index.js'
 import { getInventoryApi } from '../api-instance.js'
 import AssetFormDialog from '../components/AssetFormDialog.svelte'
 import { t } from '../i18n.js'
-import { canInventory, INVENTORY_PERMISSIONS } from '../permissions.js'
+import { canInventory } from '../permissions.js'
 import { inventoryKeys } from '../query.js'
 
 /**
@@ -35,55 +46,107 @@ interface Props {
 const { workspaceId }: Props = $props()
 
 const api = getInventoryApi()
+const queryClient = useQueryClient()
 
-let search = $state('')
+let searchText = $state('')
 let statusFilter = $state<string>('')
 let showArchived = $state(false)
 let dialogOpen = $state(false)
+/** The row the dialog is editing, or null when it is adding one. */
+let editingAsset = $state<Asset | null>(null)
+/** The row awaiting an archive confirmation. */
+let archiving = $state<Asset | null>(null)
 
 // Debounce the search into the cache key, so typing does not refetch per keystroke.
-let q = $state('')
+let query = $state('')
 $effect(() => {
-  const value = search
-  const timer = setTimeout(() => (q = value), 250)
+  const value = searchText
+  const timer = setTimeout(() => (query = value), 250)
   return () => clearTimeout(timer)
 })
 
-const filters = $derived.by(() => {
-  const f: Record<string, unknown> = {}
-  if (q) f.q = q
-  if (statusFilter) f.status = statusFilter
-  if (!showArchived) f.archived = false
-  return Object.keys(f).length ? f : undefined
+/**
+ * Every filter is part of the key and part of the request.
+ *
+ * Filtering in the browser is only ever right for a list that is entirely loaded, and this one is
+ * paged: dropping archived rows client-side returned twenty rows, showed eleven, and made the list
+ * look short rather than paged.
+ */
+const filters = $derived({
+  ...(query ? { q: query } : {}),
+  ...(statusFilter ? { status: statusFilter as AssetStatus } : {}),
+  archived: showArchived,
 })
 
-const assetsQuery = createQuery(() => ({
+/**
+ * Whether anything is *narrowing* the list.
+ *
+ * The archived switch is not in here: it widens the list rather than narrowing it, so a workspace
+ * with no assets and the switch on is still empty rather than filtered, and offering to "clear" it
+ * would hide rows somebody just asked to see.
+ */
+const narrowed = $derived(Boolean(query) || Boolean(statusFilter))
+
+function clearFilters() {
+  searchText = ''
+  query = ''
+  statusFilter = ''
+}
+
+interface AssetPage {
+  items: Asset[]
+  nextCursor: string | null
+  /** `page()` in `@kernhq/contracts` declares it; this module's server does not fill it yet. */
+  total?: number
+}
+
+const assetsQuery = createInfiniteQuery(() => ({
   queryKey: inventoryKeys.assets(workspaceId, filters),
-  queryFn: () =>
+  queryFn: ({ pageParam }): Promise<AssetPage> =>
     api.assets.list({
       workspaceId,
-      ...(q ? { q } : {}),
-      ...(statusFilter
-        ? { status: statusFilter as 'in_stock' | 'assigned' | 'under_repair' | 'retired' }
-        : {}),
-    }),
+      ...filters,
+      ...(pageParam ? { cursor: pageParam as string } : {}),
+    }) as Promise<AssetPage>,
+  initialPageParam: undefined as string | undefined,
+  getNextPageParam: (last: AssetPage) => last.nextCursor ?? undefined,
   enabled: Boolean(workspaceId),
 }))
 
-const assets = $derived(assetsQuery.data?.items ?? [])
-const shownAssets = $derived(showArchived ? assets : assets.filter((a) => !a.archivedAt))
-const counts = $derived({
-  total: assets.length,
-  assigned: assets.filter((a) => a.status === 'assigned').length,
-  inStock: assets.filter((a) => a.status === 'in_stock').length,
-  repair: assets.filter((a) => a.status === 'under_repair').length,
-})
+const assets = $derived(assetsQuery.data?.pages.flatMap((page) => page.items) ?? [])
 
+/**
+ * A count that stays true while the list pages.
+ *
+ * `t('count', { n: assets.length })` counted the pages *loaded*, so 120 assets read "50 assets" and
+ * then "100 assets" after Load more — a number that is simply wrong, on the line whose whole job is
+ * to be the number. When the server fills `total` that is the honest figure; until it does, a list
+ * with another page says how many it is *showing* rather than claiming that is all there is.
+ */
+const reportedTotal = $derived(assetsQuery.data?.pages.at(-1)?.total)
+const countLine = $derived(
+  reportedTotal !== undefined
+    ? t('count', { n: reportedTotal })
+    : assetsQuery.hasNextPage
+      ? t('count_showing', { n: assets.length })
+      : t('count', { n: assets.length }),
+)
+
+/**
+ * Every status the contract can hold, offered ahead of the features that set them.
+ *
+ * Until custody and repairs ship, nothing writes a status, so every asset is `in_stock` and the
+ * other five options correctly return nothing. That is the data being uniform rather than the
+ * filter being broken — and the alternative, hiding options and adding them back one release
+ * later, teaches somebody the list is unstable. The README says the same thing in as many words.
+ */
 const statusOptions: SelectOption[] = [
   { value: '', label: t('filter_all_statuses') },
   { value: 'in_stock', label: t('status_in_stock') },
   { value: 'assigned', label: t('status_assigned') },
+  { value: 'reserved', label: t('status_reserved') },
   { value: 'under_repair', label: t('status_under_repair') },
+  { value: 'lost', label: t('status_lost') },
   { value: 'retired', label: t('status_retired') },
 ]
 
@@ -91,157 +154,293 @@ function statusTone(status: string): BadgeTone {
   switch (status) {
     case 'assigned':
       return 'info'
+    case 'reserved':
+      return 'info'
     case 'under_repair':
       return 'warning'
+    case 'lost':
+      return 'danger'
     case 'retired':
       return 'grey'
     default:
       return 'success'
   }
 }
-const statusLabel = (status: string) => t(`status_${status}`)
+
+// ---------------------------------------------------------------- row actions
+
+/**
+ * `assets.update` and `assets.archive` had no entry point anywhere in this module.
+ *
+ * Three of five procedures were unreachable and the module had one screen, so an asset could be
+ * created and then never corrected — a typo in a name was permanent, and a laptop that left the
+ * company stayed in the register for ever.
+ */
+let acting = $state(false)
+
+/** Archive and restore are one procedure, so they are one mutation and one busy flag. */
+interface ArchiveVars {
+  assetId: string
+  archived: boolean
+  name: string
+}
+
+const setArchived = createMutation(() => ({
+  mutationFn: (vars: ArchiveVars) =>
+    api.assets.archive({ workspaceId, assetId: vars.assetId, archived: vars.archived }),
+  onSuccess: (_saved: Asset, vars: ArchiveVars) => {
+    toast.success(t(vars.archived ? 'archived_toast' : 'restored_toast', { name: vars.name }))
+    void queryClient.invalidateQueries({ queryKey: inventoryKeys.all })
+    archiving = null
+  },
+  onError: (error: Error) => toast.error(error.message || t('common.error')),
+  onSettled: () => {
+    acting = false
+  },
+}))
+
+/**
+ * The guard is a plain flag set in the same tick as the click.
+ *
+ * `disabled={mutation.isPending}` reaches the button one render later, and two quick clicks are one
+ * render apart — so on a confirmation it files two decisions.
+ */
+function confirmArchive() {
+  const target = archiving
+  if (!target || acting) return
+  acting = true
+  setArchived.mutate({ assetId: target.id, archived: true, name: target.name })
+}
+
+function restore(asset: Asset) {
+  if (acting) return
+  acting = true
+  setArchived.mutate({ assetId: asset.id, archived: false, name: asset.name })
+}
+
+function openCreate() {
+  editingAsset = null
+  dialogOpen = true
+}
+
+function openEdit(asset: Asset) {
+  editingAsset = asset
+  dialogOpen = true
+}
+
+/**
+ * Restoring is not destructive and needs no confirmation; archiving is, and states what happens.
+ * Hidden rather than disabled for somebody without `manage`: they may never do it, so the menu is
+ * not there at all rather than being a door that will not open.
+ */
+function actionsFor(asset: Asset): MenuItem[] {
+  const items: MenuItem[] = [{ label: t('common.edit'), icon: 'square-pen', onSelect: () => openEdit(asset) }]
+  if (asset.archivedAt) {
+    items.push({ label: t('restore'), icon: 'rotate-ccw', onSelect: () => restore(asset) })
+  } else {
+    items.push({ type: 'separator' })
+    items.push({
+      label: t('common.archive'),
+      icon: 'archive',
+      danger: true,
+      onSelect: () => (archiving = asset),
+    })
+  }
+  return items
+}
+
+const workspaceName = $derived(session.workspaces.find((w) => w.id === workspaceId)?.name ?? '')
+const canManage = $derived(canInventory('manage'))
+/** The last column carries the row menu, and only exists when there is a menu to carry. */
+const COLUMNS = $derived(
+  canManage
+    ? 'minmax(96px, 110px) minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr) 132px 44px'
+    : 'minmax(96px, 110px) minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr) 132px',
+)
+const SKELETON_ROWS = [0, 1, 2, 3, 4, 5]
 </script>
 
-<svelte:head><title>{t('title')} · {session.workspaces.find((w) => w.id === workspaceId)?.name ?? ''}</title></svelte:head>
+<PageHeader crumbs={[{ label: workspaceName }, { label: t('title') }]} title={t('title')}>
+  {#snippet search()}
+    <Input
+      bind:value={searchText}
+      type="search"
+      size="sm"
+      placeholder={t('search_placeholder')}
+      aria-label={t('search_placeholder')}
+    />
+  {/snippet}
+  {#snippet actions()}
+    <Select bind:value={statusFilter} options={statusOptions} size="sm" ariaLabel={t('status')} />
+    {#if canManage}
+      <Button size="sm" icon="plus" onclick={openCreate}>{t('new')}</Button>
+    {/if}
+  {/snippet}
+</PageHeader>
 
-<section>
-  <header>
-    <h1>{t('nav')}</h1>
-    <div class="actions">
-      <Input bind:value={search} type="search" size="sm" placeholder={t('search_placeholder')} aria-label={t('search_placeholder')} />
-      <Select bind:value={statusFilter} options={statusOptions} size="sm" />
-      {#if canInventory('manage')}
-        <Button size="sm" onclick={() => (dialogOpen = true)}>{t('new')}</Button>
-      {/if}
-    </div>
-  </header>
-
-  <div class="tiles">
-    <StatTile size="md" label={t('count', { n: counts.total })} value={String(counts.total)} />
-    <StatTile size="md" label={t('status_in_stock')} value={String(counts.inStock)} />
-    <StatTile size="md" label={t('status_assigned')} value={String(counts.assigned)} />
-    <StatTile size="md" label={t('status_under_repair')} value={String(counts.repair)} />
+<Page>
+  <div class="bar">
+    <p class="count" aria-live="polite">{countLine}</p>
+    <Switch bind:checked={showArchived} size="sm" label={t('show_archived')} />
   </div>
 
   {#if assetsQuery.isPending}
-    <Spinner />
+    <!-- Shaped like the table it is standing in for, not a spinner in the middle of a content
+         area: the page does not jump when the rows arrive, and the shape says what is coming. -->
+    <div class="skeleton">
+      {#each SKELETON_ROWS as row (row)}
+        <div class="srow" style:grid-template-columns={COLUMNS}>
+          <Skeleton height="12px" width="72%" />
+          <Skeleton height="12px" width="58%" />
+          <Skeleton height="12px" width="46%" />
+          <Skeleton height="12px" width="40%" />
+          <Skeleton height="18px" width="76px" radius="999px" />
+          {#if canManage}<Skeleton height="12px" width="16px" />{/if}
+        </div>
+      {/each}
+    </div>
   {:else if assetsQuery.isError}
-    <p class="error">{t('common.error')}</p>
-  {:else if shownAssets.length === 0}
+    <!-- An error needs a message *and* a way out of it. This was a bare red sentence. -->
+    <EmptyState icon="triangle-alert" title={t('load_error')} description={t('common.error')}>
+      {#snippet actions()}
+        <Button variant="secondary" onclick={() => void assetsQuery.refetch()}>
+          {t('common.retry')}
+        </Button>
+      {/snippet}
+    </EmptyState>
+  {:else if assets.length === 0 && narrowed}
+    <!-- A search that matched nothing used to say "No assets yet · Add the first laptop…" beside a
+         New asset button — the wrong sentence and the wrong action for a workspace full of them. -->
+    <EmptyState icon="search" title={t('no_matches')} description={t('no_matches_desc')}>
+      {#snippet actions()}
+        <Button variant="secondary" onclick={clearFilters}>{t('clear_filters')}</Button>
+      {/snippet}
+    </EmptyState>
+  {:else if assets.length === 0}
     <EmptyState icon="briefcase" title={t('empty')} description={t('empty_desc')}>
       {#snippet actions()}
-        {#if canInventory('manage')}
-          <Button onclick={() => (dialogOpen = true)}>{t('new')}</Button>
+        {#if canManage}
+          <Button onclick={openCreate}>{t('new')}</Button>
         {/if}
       {/snippet}
     </EmptyState>
   {:else}
-    <p class="count">{t('count', { n: shownAssets.length })}</p>
-    <div class="table" role="table" aria-label={t('title')}>
-      <div class="thead" role="row">
-        <span role="columnheader">{t('code')}</span>
-        <span role="columnheader">{t('name')}</span>
-        <span role="columnheader">{t('location')}</span>
-        <span role="columnheader">{t('warranty_until')}</span>
-        <span role="columnheader">{t('category')}</span>
-      </div>
-      {#each shownAssets as asset (asset.id)}
-        <div class="trow" role="row" tabindex="-1">
-          <span class="cell code" role="cell"><code>{asset.code}</code></span>
-          <span class="cell who" role="cell">
+    <Table columns={COLUMNS} ariaLabel={t('title')}>
+      <TableHeader>
+        <TableCell header>{t('code')}</TableCell>
+        <TableCell header>{t('name')}</TableCell>
+        <TableCell header>{t('location')}</TableCell>
+        <TableCell header>{t('warranty_until')}</TableCell>
+        <TableCell header>{t('status')}</TableCell>
+        {#if canManage}<TableCell header end></TableCell>{/if}
+      </TableHeader>
+      {#each assets as asset (asset.id)}
+        <TableRow>
+          <TableCell><code>{asset.code}</code></TableCell>
+          <TableCell>
             <span class="stack">
               <span class="name">{asset.name}</span>
-              {#if asset.serialNumber}<span class="sub">S/N {asset.serialNumber}</span>{/if}
+              <!-- `S/N` was a literal English abbreviation sitting in the middle of a Persian,
+                   Arabic, German or Turkish table; `serial_number` is translated in all five. -->
+              {#if asset.serialNumber}
+                <span class="sub">
+                  {t('serial_number')}:
+                  <span class="ltr">{asset.serialNumber}</span>
+                </span>
+              {/if}
             </span>
-          </span>
-          <span class="cell muted" role="cell">{asset.location ?? '—'}</span>
-          <span class="cell muted" role="cell">{asset.warrantyUntil ?? '—'}</span>
-          <span class="cell" role="cell">
+          </TableCell>
+          <TableCell><span class="muted">{asset.location ?? '—'}</span></TableCell>
+          <TableCell><span class="muted">{asset.warrantyUntil ?? '—'}</span></TableCell>
+          <TableCell>
             {#if asset.archivedAt}
               <Badge tone="grey">{t('archived')}</Badge>
             {:else}
-              <Badge tone={statusTone(asset.status)}>{statusLabel(asset.status)}</Badge>
+              <Badge tone={statusTone(asset.status)}>{t(`status_${asset.status}`)}</Badge>
             {/if}
-          </span>
-        </div>
+          </TableCell>
+          {#if canManage}
+            <TableCell end>
+              <DropdownMenu items={actionsFor(asset)} align="end">
+                {#snippet trigger(props)}
+                  <IconButton
+                    {...props}
+                    icon="ellipsis"
+                    size={28}
+                    label={t('row_actions', { name: asset.name })}
+                  />
+                {/snippet}
+              </DropdownMenu>
+            </TableCell>
+          {/if}
+        </TableRow>
       {/each}
-    </div>
-  {/if}
-</section>
+    </Table>
 
-<AssetFormDialog bind:open={dialogOpen} {workspaceId} />
+    {#if assetsQuery.hasNextPage}
+      <div class="more">
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={assetsQuery.isFetchingNextPage}
+          onclick={() => assetsQuery.fetchNextPage()}
+        >
+          {assetsQuery.isFetchingNextPage ? t('common.loading') : t('load_more')}
+        </Button>
+      </div>
+    {/if}
+  {/if}
+</Page>
+
+<AssetFormDialog bind:open={dialogOpen} {workspaceId} asset={editingAsset} />
+
+<!-- Archiving states what happens and to what, rather than asking "Are you sure?". -->
+<Dialog
+  open={archiving !== null}
+  size="sm"
+  title={t('archive_title', { name: archiving?.name ?? '' })}
+  onOpenChange={(next) => {
+    if (!next) archiving = null
+  }}
+>
+  <p class="dialog-body">{t('archive_body')}</p>
+  {#snippet footer()}
+    <Button variant="ghost" onclick={() => (archiving = null)}>{t('common.cancel')}</Button>
+    <Button variant="danger" onclick={confirmArchive} loading={acting}>{t('common.archive')}</Button>
+  {/snippet}
+</Dialog>
 
 <style>
-  header {
+  .bar {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
     flex-wrap: wrap;
-  }
-  h1 {
-    font-size: 18px;
-    font-weight: 600;
-    color: var(--kern-ink-900);
-  }
-  .actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .tiles {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-    gap: 10px;
-    margin-top: 14px;
+    margin-bottom: 8px;
   }
   .count {
-    margin: 14px 0 6px;
     font-size: 12px;
-    color: var(--kern-ink-500);
+    color: var(--kern-ink-280);
   }
-  .error {
-    color: var(--kern-danger);
-    font-size: 13px;
-  }
-  .table {
-    margin-top: 4px;
-    border: 1px solid var(--kern-line);
-    border-radius: 10px;
-    overflow: hidden;
-    background: var(--kern-paper);
-  }
-  .thead,
-  .trow {
-    display: grid;
-    grid-template-columns: 110px minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr) 120px;
-    gap: 10px;
-    align-items: center;
-    padding: 8px 12px;
-  }
-  .thead {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--kern-ink-500);
-    background: var(--kern-canvas-subtle, transparent);
-    border-bottom: 1px solid var(--kern-line);
-  }
-  .trow {
-    border-bottom: 1px solid var(--kern-line);
-    font-size: 13px;
-  }
-  .trow:last-child {
-    border-bottom: none;
-  }
-  .cell {
-    min-width: 0;
+  .muted {
+    color: var(--kern-ink-280);
   }
   code {
     font-size: 12px;
-    color: var(--kern-ink-700);
+    color: var(--kern-ink-600);
   }
-  .who .stack {
+  /* A tag and a serial are Latin identifiers read character by character. Inside a Persian or
+     Arabic row the bidi algorithm will happily reorder a mixed letter-and-digit run, so they are
+     isolated and left-to-right — the characters have to match what is printed on the sticker. */
+  code,
+  .ltr {
+    direction: ltr;
+    /* `isolate` works on an inline box; `inline-block` would also work and would cost the
+       ellipsis on the line above it. */
+    unicode-bidi: isolate;
+  }
+  .stack {
     display: flex;
     flex-direction: column;
     min-width: 0;
@@ -255,12 +454,34 @@ const statusLabel = (status: string) => t(`status_${status}`)
   }
   .sub {
     font-size: 11px;
-    color: var(--kern-ink-500);
+    /* Muted with a colour, never with opacity: a faded row at 0.5 is unreadable whatever its token. */
+    color: var(--kern-ink-280);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .muted {
-    color: var(--kern-ink-500);
+  .skeleton {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .srow {
+    display: grid;
+    align-items: center;
+    gap: 12px;
+    /* The row heights of `Table`, so nothing shifts when the real rows replace these. */
+    padding: 14px 12px;
+    border-bottom: 1px solid var(--kern-border-hairline);
+  }
+  .more {
+    display: flex;
+    justify-content: center;
+    padding: 16px 0;
+  }
+  .dialog-body {
+    margin: 0;
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--kern-ink-700);
   }
 </style>

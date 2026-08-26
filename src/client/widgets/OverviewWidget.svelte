@@ -3,6 +3,7 @@ import { Badge, type BadgeTone, WidgetState } from '@kernhq/ui'
 import { createQuery } from '@tanstack/svelte-query'
 import { getInventoryApi } from '../api-instance.js'
 import { t } from '../i18n.js'
+import { inventoryKeys } from '../query.js'
 
 /**
  * A dashboard card.
@@ -19,18 +20,30 @@ const { workspaceId, settings }: Props = $props()
 const limit = $derived(Number(settings?.limit ?? 5))
 const api = getInventoryApi()
 
+/**
+ * The card asks for exactly what it shows.
+ *
+ * It used to fetch the default page and then drop archived rows and slice — so a workspace whose
+ * last twenty assets were all archived rendered an empty card that was not empty. The server knows
+ * how to exclude them and how many to send.
+ */
+const filters = $derived({ archived: false, limit })
+
 const assets = createQuery(() => ({
-  queryKey: ['inventory', 'assets', workspaceId],
-  queryFn: () => api.assets.list({ workspaceId }),
+  queryKey: inventoryKeys.assets(workspaceId, filters),
+  queryFn: () => api.assets.list({ workspaceId, ...filters }),
   enabled: Boolean(workspaceId),
 }))
 
-const items = $derived((assets.data?.items ?? []).filter((a) => !a.archivedAt).slice(0, limit))
+const items = $derived(assets.data?.items ?? [])
 
 function statusTone(status: string): BadgeTone {
   switch (status) {
     case 'assigned':
+    case 'reserved':
       return 'info'
+    case 'lost':
+      return 'danger'
     case 'under_repair':
       return 'warning'
     case 'retired':

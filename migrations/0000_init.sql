@@ -1,8 +1,15 @@
 -- `create schema if not exists` matters: the kernel creates `mod_inventory` before running these, so
--- the bare form fails on boot.
+-- the bare form fails on boot. Every table and index is guarded the same way, so an interrupted
+-- first boot can be retried rather than needing the schema dropped by hand.
+--
+-- `btree_gist` is what lets an exclusion constraint mix `uuid with =` and `tstzrange with &&`, which
+-- is how `0001_rls.sql` makes two open custody periods for one asset impossible. Without it that
+-- constraint fails with "data type uuid has no default operator class for access method gist" —
+-- during the module's own migration, so the *service does not start*. Core creates four extensions
+-- and this is not one of them; HR declares its own for the same reason.
+CREATE EXTENSION IF NOT EXISTS btree_gist;--> statement-breakpoint
 CREATE SCHEMA IF NOT EXISTS "mod_inventory";
 --> statement-breakpoint
-CREATE TYPE "public"."asset_status" AS ENUM('in_stock', 'assigned', 'under_repair', 'retired');--> statement-breakpoint
 CREATE TABLE IF NOT EXISTS "mod_inventory"."asset_history" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
@@ -21,7 +28,7 @@ CREATE TABLE IF NOT EXISTS "mod_inventory"."assets" (
 	"name" text NOT NULL,
 	"description" text DEFAULT '' NOT NULL,
 	"category_id" uuid,
-	"status" "asset_status" DEFAULT 'in_stock' NOT NULL,
+	"status" text DEFAULT 'in_stock' NOT NULL,
 	"custodian_user_id" uuid,
 	"custody_since" timestamp with time zone,
 	"serial_number" text,
@@ -32,6 +39,7 @@ CREATE TABLE IF NOT EXISTS "mod_inventory"."assets" (
 	"currency" char(3),
 	"warranty_until" date,
 	"photo_file_id" uuid,
+	"custom" jsonb DEFAULT '{}'::jsonb NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"archived_at" timestamp with time zone
@@ -118,6 +126,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS "inventory_assets_ws_code_uq" ON "mod_inventor
 CREATE INDEX IF NOT EXISTS "inventory_assets_ws_created_idx" ON "mod_inventory"."assets" USING btree ("workspace_id","created_at");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "inventory_assets_ws_status_idx" ON "mod_inventory"."assets" USING btree ("workspace_id","status");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "inventory_assets_ws_category_idx" ON "mod_inventory"."assets" USING btree ("workspace_id","category_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "inventory_assets_ws_custodian_idx" ON "mod_inventory"."assets" USING btree ("workspace_id","custodian_user_id") WHERE custodian_user_id is not null;--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "inventory_assets_ws_warranty_idx" ON "mod_inventory"."assets" USING btree ("workspace_id","warranty_until") WHERE warranty_until is not null;--> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS "inventory_attachments_asset_file_uq" ON "mod_inventory"."attachments" USING btree ("asset_id","file_id");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "inventory_attachments_ws_asset_idx" ON "mod_inventory"."attachments" USING btree ("workspace_id","asset_id","created_at");--> statement-breakpoint

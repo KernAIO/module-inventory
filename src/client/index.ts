@@ -17,7 +17,14 @@
  * `files` in package.json must cover every directory this entry reaches, contract source included.
  */
 
-export { type Asset, type AssetStatus, inventoryPermissions, MODULE_ID } from '../contract.js'
+export {
+  type Asset,
+  type AssetStatus,
+  InventorySettings,
+  inventoryCapabilities,
+  inventoryPermissions,
+  MODULE_ID,
+} from '../contract/index.js'
 export { createInventoryClient, type InventoryApi } from './api.js'
 export { __setInventoryApi, getInventoryApi } from './api-instance.js'
 export { type InventoryMessageKey, inventoryMessageBundles, t } from './i18n.js'

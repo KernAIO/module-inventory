@@ -1,7 +1,7 @@
 {
   "name": "@kernhq/module-inventory",
   "version": "0.1.2",
-  "description": "Kern inventory module: the company's asset register — what it owns, who holds each item, purchase and warranty details, repairs, and a full history of every change",
+  "description": "Kern inventory module: the company's asset register — what it owns, item by item, with asset tags, serial numbers, purchase and warranty details",
   "homepage": "https://github.com/KernAIO/module-inventory#readme",
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -21,6 +21,7 @@
     "migrations",
     "src",
     "drizzle.config.ts",
+    "tsconfig.base.json",
     "tsconfig.json",
     "tsconfig.client.json",
     "vitest.config.ts",
@@ -73,7 +74,7 @@
     "@kernhq/contracts": "^0.7.0",
     "@kernhq/kernel": "^0.7.0",
     "@kernhq/tsconfig": "^0.1.0",
-    "@kernhq/ui": "^0.10.0",
+    "@kernhq/ui": "^0.12.0",
     "@tanstack/svelte-query": "^6.1.0",
     "@types/node": "^24.0.0",
     "@types/pg": "^8.15.0",
@@ -87,7 +88,7 @@
   "peerDependencies": {
     "@kernhq/contracts": "^0.7.0",
     "@kernhq/kernel": "^0.7.0",
-    "@kernhq/ui": "^0.10.0",
+    "@kernhq/ui": "^0.12.0",
     "@tanstack/svelte-query": "^6.1.0",
     "svelte": "^5.46.0"
   },

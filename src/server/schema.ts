@@ -7,7 +7,7 @@ import {
   index,
   integer,
   jsonb,
-  pgEnum,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -33,20 +33,23 @@ const ts = (name: string) => timestamp(name, { withTimezone: true, mode: 'date' 
 const created = () => ts('created_at').notNull().defaultNow()
 const updated = () => ts('updated_at').notNull().defaultNow()
 
-/**
- * Asset lifecycle. Stored rather than derived because every list filter asks for it; every
- * transition is written inside the same transaction as the row it derives from.
- */
-export const assetStatus = pgEnum('asset_status', ['in_stock', 'assigned', 'under_repair', 'retired'])
-
 export const counters = schema.table(
   'counters',
   /** Per-workspace sequence sources (`asset_code`). Narrow on purpose: one row per key. */
   {
-    workspaceId: ws().primaryKey(),
-    key: text('key').primaryKey(),
+    workspaceId: ws(),
+    key: text('key').notNull(),
     value: integer('value').notNull(),
   },
+  /**
+   * Composite, declared here rather than as two `.primaryKey()` columns.
+   *
+   * Column-level `.primaryKey()` twice reads like a compound key and is not one: drizzle emits
+   * `PRIMARY KEY` on both columns and Postgres refuses the table outright — "multiple primary keys
+   * for table are not allowed", SQLSTATE 42P16. The module's migration is the first thing the
+   * kernel runs, so the failure is not a broken table but a service that will not boot.
+   */
+  (t) => [primaryKey({ columns: [t.workspaceId, t.key] })],
 )
 
 export const categories = schema.table(
@@ -74,7 +77,10 @@ export const assets = schema.table(
     name: text('name').notNull(),
     description: text('description').notNull().default(''),
     categoryId: uuid('category_id'),
-    status: assetStatus('status').notNull().default('in_stock'),
+    /** `AssetStatus` in the contract. Text, not a pg enum: every other Kern module stores a
+     * status this way, and an enum named `asset_status` in `public` is a type this module
+     * leaves behind when it is removed. */
+    status: text('status').notNull().default('in_stock'),
     /** Denormalized from `custody_periods`, which stays authoritative for history. */
     custodianUserId: uuid('custodian_user_id'),
     custodySince: ts('custody_since'),
@@ -86,6 +92,8 @@ export const assets = schema.table(
     currency: char('currency', { length: 3 }),
     warrantyUntil: date('warranty_until'),
     photoFileId: uuid('photo_file_id'),
+    /** Values for this workspace's own `field_defs`, keyed by their `key`. */
+    custom: jsonb('custom').$type<Record<string, unknown>>().notNull().default({}),
     createdAt: created(),
     updatedAt: updated(),
     archivedAt: ts('archived_at'),
@@ -95,6 +103,10 @@ export const assets = schema.table(
     index('inventory_assets_ws_created_idx').on(t.workspaceId, t.createdAt),
     index('inventory_assets_ws_status_idx').on(t.workspaceId, t.status),
     index('inventory_assets_ws_category_idx').on(t.workspaceId, t.categoryId),
+    // "What is Ada holding?" — asked by the person, by the offboarding hook, and by a widget.
+    index('inventory_assets_ws_custodian_idx')
+      .on(t.workspaceId, t.custodianUserId)
+      .where(sql`custodian_user_id is not null`),
     // The "what leaves warranty this month" scan, before a job makes it a widget's cheap query.
     index('inventory_assets_ws_warranty_idx')
       .on(t.workspaceId, t.warrantyUntil)
@@ -218,6 +230,11 @@ export const attachments = schema.table(
 
 /** Every tenant table, so the RLS migration can be checked against one list rather than memory. */
 export const TENANT_TABLES = [
+  // `counters` is a tenant table like any other: it carries `workspace_id`, so one workspace's
+  // asset-code sequence is readable to another without a policy. It was left out of this list —
+  // and therefore out of `0001_rls.sql` — because it holds no asset data, which is not the rule
+  // the file states at the top. Tracker's structurally identical `issue_counters` is covered.
+  'counters',
   'categories',
   'assets',
   'field_defs',
