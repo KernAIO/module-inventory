@@ -1,0 +1,46 @@
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request:
+concurrency:
+  group: "ci-${{ github.ref }}"
+  cancel-in-progress: true
+permissions: { contents: read }
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # The suite creates a scratch database per file, applies the migrations and proves row-level
+      # security by connecting as an unprivileged role. Nothing is mocked, so without this service
+      # the suite fails to start rather than quietly passing.
+      #
+      # 127.0.0.1, never `localhost`: a runner resolves `localhost` to ::1 first, where the
+      # published port is not listening, and the client does not retry over IPv4.
+      DATABASE_URL: postgres://kern:kern@127.0.0.1:5432/kern
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: kern
+          POSTGRES_PASSWORD: kern
+          POSTGRES_DB: kern
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U kern"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      # No `registry-url`: it writes an .npmrc with a placeholder token, and npm answers a bad
+      # token with 404 — so every public package appears to vanish at install.
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - run: if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile; else pnpm install; fi
+      - run: pnpm lint
+      # typecheck covers the client half too: this package ships Svelte components, and plain tsc
+      # cannot see inside one. Without it the screens are checked only by whoever compiles them.
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
