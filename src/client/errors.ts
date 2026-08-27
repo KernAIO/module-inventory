@@ -25,7 +25,13 @@
  *
  * Pure and string-free: this file decides *which* key, `i18n.ts` holds the words, and a `.svelte`
  * file cannot be unit-tested. `errorMessage()` at the bottom is the one function the screens call.
+ *
+ * The one import is a number from the contract — the same file the server reads it from — because a
+ * limit a sentence refuses to name is a limit nobody can plan around. It brings no runtime with it;
+ * what this file still must never reach for is `i18n.ts`, which drags a Svelte compiler in behind it.
  */
+
+import { MAX_LIVE_CATEGORIES } from '../contract/models.js'
 
 /** What oRPC hands a screen. `code` is the contract's `ErrorCode`; `data` is what the server put in it. */
 export interface ServerError {
@@ -121,9 +127,23 @@ const REASON_KEYS: Record<string, string> = {
   'inventory.repair.already_complete': 'error_repair_already_complete',
   'inventory.repair.returned_before_sent': 'error_repair_returned_before_sent',
   'inventory.category.name_taken': 'error_category_name_taken',
+  'inventory.category.order_stale': 'error_category_order_stale',
+  'inventory.category.limit_reached': 'error_category_limit_reached',
 }
 
 export const reasonKeys = (): readonly string[] => Object.keys(REASON_KEYS)
+
+/**
+ * The one refusal whose sentence has a number in it, and where that number comes from.
+ *
+ * A limit stated as "quite a lot" is not stated. `KernError.conflict` carries a reason and no data,
+ * so the server cannot hand the figure over — and it does not need to: it is a constant in the
+ * contract, which is the same file both halves read. Passed through `t`, it goes through
+ * `Intl.NumberFormat`, so a Persian reader is shown ۵۰۰ rather than 500.
+ */
+const REASON_VALUES: Record<string, Record<string, string | number>> = {
+  'inventory.category.limit_reached': { max: MAX_LIVE_CATEGORIES },
+}
 
 /**
  * The sentence a whole class of failure earns, when no reason narrows it further.
@@ -162,12 +182,17 @@ export interface ErrorLine {
   key: string
   /** The server's own sentence, for a failure nothing here recognised. Null otherwise. */
   detail: string | null
+  /** What the sentence's placeholders need. Absent for every key that has none. */
+  values?: Record<string, string | number>
 }
 
 export function errorLine(err: unknown): ErrorLine {
   const reason = reasonOf(err)
   const byReason = reason ? REASON_KEYS[reason] : undefined
-  if (byReason) return { key: byReason, detail: null }
+  if (byReason) {
+    const values = reason ? REASON_VALUES[reason] : undefined
+    return values ? { key: byReason, detail: null, values } : { key: byReason, detail: null }
+  }
 
   const code = codeOf(err)
 
@@ -194,8 +219,11 @@ export function errorLine(err: unknown): ErrorLine {
  * `@kernhq/ui`, and that entry point drags a Svelte compiler into whatever imports it, which is
  * what makes a helper untestable.
  */
-export function errorMessage(err: unknown, translate: (key: string) => string): string {
+export function errorMessage(
+  err: unknown,
+  translate: (key: string, values?: Record<string, string | number>) => string,
+): string {
   const line = errorLine(err)
-  const sentence = translate(line.key)
+  const sentence = translate(line.key, line.values)
   return line.detail ? `${sentence} — ${line.detail}` : sentence
 }

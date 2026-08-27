@@ -6,35 +6,61 @@ import {
   DropdownMenu,
   EmptyState,
   Field,
+  Icon,
   IconButton,
   Input,
   type MenuItem,
+  messageLocale,
   navigation,
   SettingsPage,
   SettingsSection,
   Skeleton,
   Switch,
   session,
-  Table,
-  TableCell,
-  TableHeader,
-  TableRow,
   toast,
 } from '@kernhq/ui'
 import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query'
+import { untrack } from 'svelte'
+import { dndzone, SHADOW_ITEM_MARKER_PROPERTY_NAME } from 'svelte-dnd-action'
 import type { Category } from '../../contract/index.js'
 import { getInventoryApi } from '../api-instance.js'
 import { isolated } from '../bidi.js'
-import { errorMessage } from '../errors.js'
+import { errorMessage, reasonOf } from '../errors.js'
 import { t } from '../i18n.js'
 import { INVENTORY_PERMISSIONS } from '../permissions.js'
 import { inventoryKeys } from '../query.js'
+import { placementOf } from '../reorder.js'
+import {
+  consider as considered,
+  finalize as finalized,
+  move as moved,
+  refused,
+  reseed,
+  type Sequence,
+  type Step,
+  saved,
+  seed,
+  start,
+} from '../sequence.js'
 
 /**
- * How a workspace groups what it owns.
+ * How a workspace groups what it owns, and the order it groups them in.
  *
  * `assets.list` has taken a `categoryId` filter since the module existed and nothing could create a
  * category, so the filter had exactly one possible answer — this page is the other half of it.
+ *
+ * **The order is dragged, not typed.** This page used to carry a *Position* field: a number box on
+ * the add-and-rename dialog, with a hint explaining that lower comes first and that two categories
+ * sharing a number fall back to their names. That is a database column with a form around it.
+ * Nobody arranges their filing by integer, the field invited the one state it then had to explain,
+ * and moving a category two places meant working out a number that would land it there. It is a
+ * list you drag now, and `categories.reorder` writes the whole sequence in one transaction.
+ *
+ * **A drag is a gesture, never a requirement.** It is unreachable by keyboard and by anybody who
+ * cannot hold a pointer steady, so every row carries move-up and move-down buttons that do exactly
+ * the same thing, and the result is spoken into a live region rather than moving in silence. Those
+ * buttons are the *only* keyboard route: the drag library ships one of its own, and shipping both
+ * left both half-working, so it is switched off — see `keepKeyboardOnTheButtons`.
  *
  * **Nothing here deletes.** `assets.category_id` carries no foreign key, so removing a row would
  * leave every asset filed under it pointing at nothing: a blank column, and a timeline entry saying
@@ -59,7 +85,7 @@ const canManage = $derived(session.can(INVENTORY_PERMISSIONS.categories))
 let showArchived = $state(false)
 
 /**
- * One query for every category, archived ones included, filtered here.
+ * One query for every category, archived ones included, split here.
  *
  * Two things come out of that. It is the key `AssetsPage` and `AssetDetailPanel` already use, so
  * arriving at this page after either of them costs no request — and, the reason it changed, it is
@@ -74,62 +100,240 @@ const categoriesQuery = createQuery(() => ({
   enabled: Boolean(workspaceId),
 }))
 const everything = $derived<Category[]>(categoriesQuery.data ?? [])
-const categories = $derived(showArchived ? everything : everything.filter((row) => !row.archivedAt))
+
+/**
+ * The two lists, and why they are two.
+ *
+ * `live` is the sequence: it is what a person arranges, what every picker and filter shows, and the
+ * exact set `categories.reorder` insists on being handed. An archived category is in none of those
+ * places, so it has no position to arrange — putting it in the same draggable list would let
+ * somebody carefully place a row that nobody but this page will ever see, between two rows it does
+ * not sit between anywhere else. They get their own group, in their own order.
+ *
+ * Sorted with the reader's own collation rather than the runtime's: `localeCompare` with no locale
+ * sorts Persian and Turkish names by whatever the browser happens to default to.
+ */
+const live = $derived(everything.filter((row) => !row.archivedAt))
+const collator = $derived(new Intl.Collator(messageLocale()))
+const archived = $derived(
+  everything.filter((row) => row.archivedAt).sort((a, b) => collator.compare(a.name, b.name)),
+)
 /** Rows exist, and the switch is hiding all of them. A different sentence from having none. */
-const allArchived = $derived(everything.length > 0 && categories.length === 0)
+const allArchived = $derived(live.length === 0 && archived.length > 0 && !showArchived)
+
+// ------------------------------------------------------------------------------- the sequence
+
+const FLIP = 140
+
+/**
+ * The order on screen, the two snapshots behind it, and the two flags — one value, in `sequence.ts`.
+ *
+ * It lives next door rather than here because a `.svelte` file cannot be unit-tested in this package,
+ * and every defect this screen has had was an *ordering* rather than a calculation: a keyboard drag
+ * ending on a different event from a pointer drag, a refusal rolling back to a list the server had
+ * already rejected, a keypress arriving while the last one was still being written. Each of those is
+ * three assertions in `sequence.test.ts` and three careful readings here.
+ *
+ * `$state.raw` and not a plain `$state`: a deep-reactive proxy hands the drag library a different
+ * object on every read, and it reads that as an endless stream of changes.
+ */
+let sequence = $state.raw<Sequence<Category>>(start<Category>([]))
+let announcements = $state<[string, string]>(['', ''])
+let pulse = false
+
+/**
+ * The library's own types want a mutable array, and its keyboard action really does splice the one
+ * it is given — which is the route this screen switches off below. Nothing here ever mutates it.
+ */
+const rows = $derived(sequence.rows as Category[])
+
+/**
+ * Seed the sequence from the query, and *only* from it.
+ *
+ * `seed` declines while a drag or a save is in progress, so a refetch landing mid-gesture cannot pull
+ * the list out from under the pointer or replace the optimistic order with data the write has not
+ * reached yet. The flags are read inside `seed` rather than here, which is also what keeps them out
+ * of this effect's dependencies: reading one directly would re-run the effect when it cleared, and
+ * re-seed from a query the write has not reached.
+ *
+ * A skipped seed is dropped rather than queued, and the two ways back are deliberate: a successful
+ * write answers with the sequence it wrote, and a refusal re-seeds from what the server actually has.
+ *
+ * **`untrack` around the read, or this effect feeds itself.** `seed` returns a new object, so an
+ * effect that both reads and writes `sequence` invalidates its own dependency and Svelte stops it
+ * with `effect_update_depth_exceeded` — at runtime, on a screen that type-checks perfectly. The one
+ * thing this is allowed to react to is the query.
+ */
+$effect(() => {
+  const next = live
+  sequence = untrack(() => seed(sequence, next))
+})
+
+const isShadow = (category: Category) =>
+  (category as unknown as Record<string, unknown>)[SHADOW_ITEM_MARKER_PROPERTY_NAME] === true
+
+/** The reason token the server sends when the list no longer describes the workspace. */
+const ORDER_STALE = 'inventory.category.order_stale'
+
+const reorder = createMutation(() => ({
+  mutationFn: (categoryIds: readonly string[]) =>
+    api.categories.reorder({ workspaceId, categoryIds: [...categoryIds] }),
+  onSuccess: (written: Category[]) => {
+    // The server answers the sequence it wrote, so there is nothing to guess and no flash: the
+    // optimistic list is replaced by the same list. When somebody kept pressing an arrow key while
+    // this was in flight, `saved` hands back the list those presses add up to and it goes now —
+    // one more request for any number of presses, and never one per keypress arriving out of order.
+    take(saved(sequence, written))
+    // Refreshes the picker on the asset form and the filter on the list, which read the same query.
+    void queryClient.invalidateQueries({ queryKey: inventoryKeys.all })
+  },
+  /**
+   * Say why, and — for the one refusal a person can act on — leave them able to act on it.
+   *
+   * A rollback alone is what made `order_stale` unrecoverable. It restores `settled`, which is the
+   * list the server has just refused, and the seeding effect cannot replace it: that effect is keyed
+   * on the query's data, and the refetch after the invalidation returns the value it already skipped
+   * while the save was in flight. Same value, no change, no re-run — so every retry sent the same
+   * stale list and earned the same refusal, under a message telling the reader to try again.
+   *
+   * So the invalidation is awaited and the list is re-seeded from what actually came back. Read out
+   * of the cache rather than out of `live`, because that is the value this screen is about to be
+   * given and reading it directly does not depend on anything having changed.
+   */
+  onError: async (error: unknown) => {
+    toast.error(errorMessage(error, t))
+    const stale = reasonOf(error) === ORDER_STALE
+    sequence = refused(sequence)
+    await queryClient.invalidateQueries({ queryKey: inventoryKeys.all })
+    if (!stale) return
+    const fresh = queryClient.getQueryData<Category[]>(inventoryKeys.categories(workspaceId, true))
+    if (fresh) sequence = reseed(fresh.filter((row) => !row.archivedAt))
+  },
+}))
+
+/**
+ * Adopt a transition, and do the work it leaves behind: post a list, speak a sentence, or neither.
+ *
+ * The three decisions themselves are in `sequence.ts`, with a test each. This is the wiring.
+ */
+function take(step: Step<Category>) {
+  sequence = step.next
+  if (step.announce) announce(step.announce.list, step.announce.id)
+  if (step.save) reorder.mutate(step.save)
+}
+
+function move(category: Category, delta: number) {
+  take(moved(sequence, category.id, delta))
+}
+
+function consider(event: CustomEvent<{ items: Category[]; info: { trigger: string } }>) {
+  take(considered(sequence, event.detail.items, event.detail.info.trigger))
+}
+
+function finalize(event: CustomEvent<{ items: Category[]; info: { id: string } }>) {
+  take(
+    finalized(
+      sequence,
+      event.detail.items.filter((category) => !isShadow(category)),
+      event.detail.info.id,
+    ),
+  )
+}
+
+/**
+ * The keys `svelte-dnd-action` claims on a row, held back before they ever reach it.
+ *
+ * **This screen has one keyboard route to reordering, and it is the two buttons on each row.**
+ *
+ * The library ships a second one, and shipping both left both half-working. Its keyboard drag put a
+ * tab stop on every row — a stop that announces nothing and does nothing until you know to press
+ * Enter on it — and then fired a `finalize` on *every arrow key*, so moving a category three places
+ * was three writes, of which the guard discarded two. It also ends on a `consider` rather than a
+ * `finalize`, which is the event asymmetry `sequence.ts` exists to absorb.
+ *
+ * The house rule is that a drag must have a **non-drag equivalent**, not that the library's drag must
+ * also be driveable from the keyboard. *Move up* and *move down* are that equivalent: they are real
+ * buttons with real names, they are reachable in the same tab order as everything else on the page,
+ * and one press is one move whatever the network is doing. So the library's keyboard route is turned
+ * off rather than left as a worse duplicate of them — `zoneItemTabIndex: -1` takes the rows out of the
+ * tab order, and this takes the trigger keys away from a row that has been focused by a click, which
+ * is the one way left to reach it.
+ *
+ * In the capture phase on the list, because the library listens on each row: a capture handler on the
+ * ancestor runs first, and `stopPropagation` there means the row's own listener never sees the key. It
+ * only ever fires for a key pressed on a **row**; a key on a button inside one is somebody using the
+ * controls, and passes straight through.
+ */
+const LIBRARY_DRAG_KEYS = new Set(['Enter', ' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'])
+
+function keepKeyboardOnTheButtons(event: KeyboardEvent) {
+  const target = event.target as HTMLElement | null
+  if (!target || target.parentElement !== event.currentTarget) return
+  if (LIBRARY_DRAG_KEYS.has(event.key)) event.stopPropagation()
+}
+
+/**
+ * What a screen reader is told, and why it never contains a number.
+ *
+ * "position 4 of 9" asks somebody to hold two numbers in their head to work out what a neighbour's
+ * name says outright — and a number is the thing this page stopped showing. The sentence describes
+ * where the row *is* rather than what just happened, so it is still true when the answer is that
+ * the row could not move: pressing *move up* on the first row says it is first.
+ */
+function announce(list: readonly Category[], id: string) {
+  const name = list.find((category) => category.id === id)?.name
+  const spot = placementOf(list, id)
+  if (name === undefined || spot.at === 'gone') return
+  const sentence =
+    spot.at === 'after'
+      ? t('category_position_after', isolated({ name, other: spot.previous.name }))
+      : t(spot.at === 'first' ? 'category_position_first' : 'category_position_last', isolated({ name }))
+  /**
+   * Two regions, written alternately, because one would fall silent.
+   *
+   * A live region announces a *change* to its text, and pressing *move down* twice on the row that
+   * is already last produces the same sentence twice — so the second press would say nothing, which
+   * reads as a broken button to the one person who cannot see that nothing moved. Filling one region
+   * while emptying the other makes every announcement a change, whatever the words are. The
+   * alternative trick is a trailing zero-width space, and it puts a character nobody can see into
+   * the source for somebody to delete by accident.
+   */
+  pulse = !pulse
+  announcements = pulse ? [sentence, ''] : ['', sentence]
+}
 
 // ------------------------------------------------------------------ the add / rename dialog
 
 let editing = $state<Category | null>(null)
 let dialogOpen = $state(false)
 let name = $state('')
-let orderText = $state('')
 
 function openCreate() {
   editing = null
   name = ''
-  orderText = '0'
   dialogOpen = true
 }
 
 function openEdit(category: Category) {
   editing = category
   name = category.name
-  orderText = String(category.order)
   dialogOpen = true
 }
 
-/**
- * A Persian keyboard produces ۱۲۳ and an Arabic one ١٢٣, and `Number` reads neither — so somebody
- * typing the digits of their own language would be told their input is not a whole number.
- */
-const toLatinDigits = (value: string) =>
-  value
-    .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x0660))
-    .replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 0x06f0))
+const canSubmit = $derived(canManage && Boolean(name.trim()))
 
-const order = $derived.by(() => {
-  const digits = toLatinDigits(orderText.trim())
-  return /^\d{1,4}$/.test(digits) ? Number(digits) : Number.NaN
-})
 /**
- * A hint and an error are two different sentences, and this field passed the hint as both.
- *
- * `hint` explains how positions sort — "Lower comes first. Categories sharing a position fall back
- * to their names." — and typing `x` restated exactly that, in red, under `aria-invalid`. It told
- * somebody nothing about what was wrong with what they had typed, and it made the field's ordinary
- * hint look like a failure the first time they read it. The error says what this box will accept.
+ * Set in the same tick as the click, for the reason `sequence.saving` above is: the attribute from
+ * `disabled={mutation.isPending}` reaches the button on the next render, and two quick clicks are one
+ * render apart — so a double-click would file the same category twice. Guarded rather than disabled,
+ * because disabling the control somebody is standing on throws their focus out to the page.
  */
-const orderError = $derived(Number.isNaN(order) ? t('category_order_invalid') : null)
-const canSubmit = $derived(canManage && Boolean(name.trim()) && !Number.isNaN(order))
-
-/** Set in the same tick as the click: `disabled={mutation.isPending}` is one render too late. */
 let saving = $state(false)
 
 const save = createMutation(() => ({
   mutationFn: () => {
     const row = editing
-    const values = { name: name.trim(), order }
+    const values = { name: name.trim() }
     return row
       ? api.categories.update({ workspaceId, categoryId: row.id, ...values })
       : api.categories.create({ workspaceId, ...values })
@@ -219,9 +423,59 @@ function actionsFor(category: Category): MenuItem[] {
   return items
 }
 
-const COLUMNS = $derived(canManage ? 'minmax(0, 1fr) 96px 44px' : 'minmax(0, 1fr) 96px')
 const SKELETON_ROWS = [0, 1, 2, 3]
 </script>
+
+<!--
+  One row, drawn the same whether it is part of the sequence or sitting in the archived group. The
+  grip, the two arrows and the drag itself belong only to the sequence: an archived category is in
+  no picker and no filter, so it has no position for anybody to arrange.
+-->
+{#snippet row(category: Category, sortable: boolean)}
+  <li
+    class="row"
+    class:sortable
+    class:shadow={isShadow(category)}
+    aria-label={sortable ? category.name : undefined}
+  >
+    {#if sortable}
+      <span class="grip" aria-hidden="true"><Icon name="grip-vertical" size={14} strokeWidth={1.8} /></span>
+    {/if}
+    <span class="cell">
+      <span class="name">{category.name}</span>
+      <!-- Only the archived state gets a badge. A "live" badge on every other row would be a column
+           of the same word, and the one it would have to borrow — `status_in_stock` — describes an
+           asset sitting in a cupboard, not a category. -->
+      {#if category.archivedAt}<Badge tone="grey">{t('archived')}</Badge>{/if}
+    </span>
+    {#if sortable}
+      <IconButton
+        icon="chevron-up"
+        size={28}
+        label={t('category_move_up', isolated({ name: category.name }))}
+        onclick={() => move(category, -1)}
+      />
+      <IconButton
+        icon="chevron-down"
+        size={28}
+        label={t('category_move_down', isolated({ name: category.name }))}
+        onclick={() => move(category, 1)}
+      />
+    {/if}
+    {#if canManage}
+      <DropdownMenu items={actionsFor(category)} align="end">
+        {#snippet trigger(props)}
+          <IconButton
+            {...props}
+            icon="ellipsis"
+            size={28}
+            label={t('row_actions', isolated({ name: category.name }))}
+          />
+        {/snippet}
+      </DropdownMenu>
+    {/if}
+  </li>
+{/snippet}
 
 <SettingsPage title={t('settings_categories')} description={t('settings_categories_desc')}>
   {#snippet actions()}
@@ -232,15 +486,19 @@ const SKELETON_ROWS = [0, 1, 2, 3]
 
   <SettingsSection flush>
     <div class="bar">
+      <!-- The hint earns its place only where the gesture is available and there is something to
+           reorder. On a one-category workspace it would explain a thing that cannot be done. -->
+      {#if canManage && live.length > 1}
+        <p class="hint">{t('category_reorder_hint')}</p>
+      {/if}
       <Switch bind:checked={showArchived} size="sm" label={t('show_archived')} />
     </div>
 
     {#if categoriesQuery.isPending}
       <div class="skeleton">
-        {#each SKELETON_ROWS as row (row)}
-          <div class="srow" style:grid-template-columns={COLUMNS}>
+        {#each SKELETON_ROWS as skeleton (skeleton)}
+          <div class="srow">
             <Skeleton height="12px" width="52%" />
-            <Skeleton height="12px" width="30%" />
             {#if canManage}<Skeleton height="12px" width="16px" />{/if}
           </div>
         {/each}
@@ -251,6 +509,19 @@ const SKELETON_ROWS = [0, 1, 2, 3]
           <Button variant="secondary" onclick={() => void categoriesQuery.refetch()}>
             {t('common.retry')}
           </Button>
+        {/snippet}
+      </EmptyState>
+    {:else if everything.length === 0}
+      <!--
+        Reachable, and worth keeping: `onWorkspaceEnabled` seeds five categories, but it only runs
+        when a workspace switches the module on — an instance upgraded with Inventory already
+        enabled never ran it, and neither does a workspace whose seeding half failed.
+      -->
+      <EmptyState icon="tag" title={t('categories_empty')} description={t('categories_empty_desc')}>
+        {#snippet actions()}
+          {#if canManage}
+            <Button onclick={openCreate}>{t('category_new')}</Button>
+          {/if}
         {/snippet}
       </EmptyState>
     {:else if allArchived}
@@ -270,58 +541,74 @@ const SKELETON_ROWS = [0, 1, 2, 3]
           </Button>
         {/snippet}
       </EmptyState>
-    {:else if categories.length === 0}
-      <!--
-        Reachable, and worth keeping: `onWorkspaceEnabled` seeds five categories, but it only runs
-        when a workspace switches the module on — an instance upgraded with Inventory already
-        enabled never ran it, and neither does a workspace whose seeding half failed.
-      -->
-      <EmptyState icon="tag" title={t('categories_empty')} description={t('categories_empty_desc')}>
-        {#snippet actions()}
-          {#if canManage}
-            <Button onclick={openCreate}>{t('category_new')}</Button>
-          {/if}
-        {/snippet}
-      </EmptyState>
     {:else}
-      <Table columns={COLUMNS} ariaLabel={t('settings_categories')}>
-        <TableHeader>
-          <TableCell header>{t('category')}</TableCell>
-          <TableCell header>{t('category_order')}</TableCell>
-          {#if canManage}<TableCell header end></TableCell>{/if}
-        </TableHeader>
-        {#each categories as category (category.id)}
-          <TableRow>
-            <TableCell>
-              <span class="cell">
-                <span class="name">{category.name}</span>
-                <!-- Only the archived state gets a badge. A "live" badge on every other row would
-                     be a column of the same word, and the one it would have to borrow —
-                     `status_in_stock` — describes an asset sitting in a cupboard, not a category. -->
-                {#if category.archivedAt}<Badge tone="grey">{t('archived')}</Badge>{/if}
-              </span>
-            </TableCell>
-            <TableCell><span class="muted">{category.order}</span></TableCell>
-            {#if canManage}
-              <TableCell end>
-                <DropdownMenu items={actionsFor(category)} align="end">
-                  {#snippet trigger(props)}
-                    <IconButton
-                      {...props}
-                      icon="ellipsis"
-                      size={28}
-                      label={t('row_actions', isolated({ name: category.name }))}
-                    />
-                  {/snippet}
-                </DropdownMenu>
-              </TableCell>
-            {/if}
-          </TableRow>
-        {/each}
-      </Table>
+      {#if canManage}
+        <!--
+          The drag is a pointer gesture here, and the arrows on each row are the keyboard equivalent.
+
+          `autoAriaDisabled`, because the library speaks its own English to screen readers and this
+          product promises five languages; every sentence a reader hears here is one of ours, in the
+          live region below. `zoneTabIndex: -1` and `zoneItemTabIndex: -1` take the list and its rows
+          out of the tab order — stops that announce nothing and do nothing, now that the library is
+          neither describing them nor driving them — and `onkeydowncapture` takes the trigger keys
+          away from a row focused by a click, which is the one way left into the library's own
+          keyboard drag. See `keepKeyboardOnTheButtons` for why that route is off rather than fixed.
+        -->
+        <ul
+          class="rows"
+          role="list"
+          aria-label={t('settings_categories')}
+          aria-busy={sequence.saving}
+          use:dndzone={{
+            items: rows,
+            type: 'inventory-categories',
+            flipDurationMs: FLIP,
+            dropTargetStyle: {},
+            autoAriaDisabled: true,
+            zoneTabIndex: -1,
+            zoneItemTabIndex: -1,
+          }}
+          onconsider={consider}
+          onfinalize={finalize}
+          onkeydowncapture={keepKeyboardOnTheButtons}
+        >
+          {#each rows as category (category.id)}
+            {@render row(category, true)}
+          {/each}
+        </ul>
+      {:else}
+        <ul class="rows" role="list" aria-label={t('settings_categories')}>
+          {#each rows as category (category.id)}
+            {@render row(category, false)}
+          {/each}
+        </ul>
+      {/if}
+
+      <!--
+        Archived categories, in their own group and in their own order.
+
+        Not part of the sequence above, because they are in no picker and no filter — there is
+        nothing for a position to be a position *in*. Sorted by name rather than by the number they
+        happened to leave with, which is the one ordering somebody can predict. `h2`, not `h3`: this
+        section is passed no title, so the page's `h1` is the level directly above it.
+      -->
+      {#if showArchived && archived.length > 0}
+        <h2 class="kern-sublabel group">{t('archived')}</h2>
+        <ul class="rows" role="list" aria-label={t('archived')}>
+          {#each archived as category (category.id)}
+            {@render row(category, false)}
+          {/each}
+        </ul>
+      {/if}
     {/if}
   </SettingsSection>
 </SettingsPage>
+
+<!-- Rendered always, and empty until there is something to say: a live region that appears at the
+     same moment as its text is a region most screen readers never announce. Two of them, written
+     alternately, so the same sentence twice in a row is still a change — see `announce`. -->
+<p class="kern-sr-only" aria-live="polite">{announcements[0]}</p>
+<p class="kern-sr-only" aria-live="polite">{announcements[1]}</p>
 
 <Dialog
   bind:open={dialogOpen}
@@ -332,13 +619,6 @@ const SKELETON_ROWS = [0, 1, 2, 3]
     <Field label={t('category')} id="inv-cat-name" required hint={t('category_name_placeholder')}>
       {#snippet children(id)}
         <Input {id} bind:value={name} maxlength={120} />
-      {/snippet}
-    </Field>
-    <Field label={t('category_order')} id="inv-cat-order" hint={t('category_order_hint')}>
-      {#snippet children(id)}
-        <div class="narrow">
-          <Input {id} bind:value={orderText} inputmode="numeric" maxlength={4} mono error={orderError} />
-        </div>
       {/snippet}
     </Field>
   </div>
@@ -368,13 +648,61 @@ const SKELETON_ROWS = [0, 1, 2, 3]
 <style>
   .bar {
     display: flex;
+    align-items: center;
     justify-content: flex-end;
+    gap: 16px;
     padding: 10px 12px;
+  }
+  .hint {
+    margin: 0;
+    min-width: 0;
+    /* Logical, so the switch stays at the trailing edge in Persian and Arabic too. */
+    margin-inline-end: auto;
+    font-size: 12px;
+    line-height: 1.5;
+    /* A colour rather than opacity, which fades text against the page whatever token it names. */
+    color: var(--kern-ink-500);
+  }
+  .rows {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 48px;
+    padding: 4px 12px;
+    border-top: 1px solid var(--kern-border-hairline);
+    font-size: 13px;
+    color: var(--kern-ink-600);
+    background: var(--kern-surface-raised);
+  }
+  .row.sortable {
+    cursor: grab;
+  }
+  .row.sortable:active {
+    cursor: grabbing;
+  }
+  /* The placeholder the drag library keeps under the cursor, marking where the row will land.
+     Hidden rather than faded: it still holds its space, so the gap opens exactly where the row is
+     going, and a half-transparent copy of a row that is already on screen under the pointer reads
+     as a rendering fault rather than as a target. */
+  .row.shadow {
+    visibility: hidden;
+  }
+  .grip {
+    display: inline-flex;
+    color: var(--kern-ink-400);
   }
   .cell {
     display: flex;
     align-items: center;
     gap: 8px;
+    flex: 1;
     min-width: 0;
   }
   .name {
@@ -388,29 +716,26 @@ const SKELETON_ROWS = [0, 1, 2, 3]
        keeps its own trailing punctuation instead of donating it to the paragraph. */
     unicode-bidi: plaintext;
   }
-  .muted {
-    /* A colour rather than opacity, which fades text against the page whatever token it names. */
-    color: var(--kern-ink-500);
-    font-variant-numeric: tabular-nums;
+  .group {
+    margin: 0;
+    padding: 16px 12px 6px;
+    border-top: 1px solid var(--kern-border-hairline);
   }
   .skeleton {
     display: flex;
     flex-direction: column;
-    gap: 1px;
   }
   .srow {
-    display: grid;
+    display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 12px;
-    padding: 14px 12px;
-    border-bottom: 1px solid var(--kern-border-hairline);
+    padding: 18px 12px;
+    border-top: 1px solid var(--kern-border-hairline);
   }
   .form {
     display: grid;
     gap: 14px;
-  }
-  .narrow {
-    max-inline-size: 140px;
   }
   .dialog-body {
     margin: 0;

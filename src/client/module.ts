@@ -15,7 +15,25 @@ import { INVENTORY_PERMISSIONS } from './permissions.js'
  */
 export const inventoryClientModule = defineClientModule({
   id: 'inventory',
-  name: 'Inventory',
+  /**
+   * A getter, for the reason every label below is one — and now that this field is rendered too, the
+   * reason reaches it.
+   *
+   * `name` was the last string in this file left as an English literal, on the grounds that a
+   * manifest name is data an operator greps rather than a string a reader sees. That stopped being
+   * true: the dashboard's widget picker heads this module's group with `mod.name` directly, so a
+   * Persian reader was shown "Inventory" as a section label in an otherwise Persian panel, and the
+   * shell's settings rail falls back to it for any module whose navigation it cannot read.
+   *
+   * `name` is typed as a plain `string` on `ClientModule`, and a getter satisfies that exactly as
+   * `get label()` does for a nav item. Nothing snapshots it: `defineClientModule` returns the object
+   * unchanged, `registerModule` pushes that same object into an array, and every reader goes through
+   * the property — so the language it resolves in is the one on screen rather than the one that
+   * happened to be loaded at import time.
+   */
+  get name() {
+    return t('nav')
+  },
   icon: 'briefcase',
   messages: inventoryMessageBundles,
 

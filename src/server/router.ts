@@ -399,7 +399,7 @@ export function inventoryRouter(kernel: Kernel) {
         .use(requires('inventory.category.manage'))
         .handler(async ({ input, context }) => {
           const row = await run(context, input.workspaceId, (tx) =>
-            svc.categories.create(tx, input.workspaceId, input.name, input.order ?? 0),
+            svc.categories.create(tx, input.workspaceId, input.name),
           )
           // No event: nothing outside this module has an opinion about a workspace's own filing.
           // The realtime change is what the settings page, the filter and the form picker need.
@@ -430,6 +430,30 @@ export function inventoryRouter(kernel: Kernel) {
           // still filed under it — so the row that changed is the category, and only the category.
           await svc.notify.change(input.workspaceId, 'category', row.id, 'updated')
           return toCategory(row)
+        }),
+
+      /**
+       * The sequence, rewritten from the ids somebody dragged it into.
+       *
+       * **One change per row that actually moved, and no kernel event** — the same two decisions
+       * the three procedures above make, for the same two reasons. Moving one category down a list
+       * of ten renumbers the handful between where it was and where it went, and each of those rows
+       * really did change; announcing the ones that did not would tell every open screen in the
+       * workspace about a write nobody performed. And nothing outside this module has an opinion
+       * about the order a workspace keeps its own filing in, so there is nothing to emit an event
+       * to: `inventoryEvents` stays the set of things another module could plausibly react to.
+       *
+       * After the commit, like everything else here. A change announced from inside the transaction
+       * describes rows a rollback then takes away, and it cannot be retracted.
+       */
+      reorder: scoped.categories.reorder
+        .use(requires('inventory.category.manage'))
+        .handler(async ({ input, context }) => {
+          const { rows, moved } = await run(context, input.workspaceId, (tx) =>
+            svc.categories.reorder(tx, input.workspaceId, input.categoryIds),
+          )
+          for (const id of moved) await svc.notify.change(input.workspaceId, 'category', id, 'updated')
+          return rows.map(toCategory)
         }),
     },
 

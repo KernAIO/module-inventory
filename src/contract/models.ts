@@ -51,8 +51,17 @@ export const Category = z.object({
   id: z.uuid(),
   workspaceId: WorkspaceId,
   name: z.string().min(1).max(120),
-  /** Where it sits in a picker. Equal orders fall back to the name, so a workspace that never
-   *  reorders anything still gets an alphabetical list rather than an arbitrary one. */
+  /**
+   * Where it sits in the sequence. **Storage, not a setting.**
+   *
+   * Nobody thinks about their categories as integers, so no screen shows this number and no input
+   * accepts one: `categories.reorder` takes the ids in the order somebody dragged them into and
+   * renumbers the live ones `0…n-1` in one transaction. `create` and a restore append, so two live
+   * categories never share a value — which is the state a "position" field invited on every save.
+   *
+   * The name is still the tiebreak in `list`, because a workspace seeded before this existed, or a
+   * row written by hand, can still hold a duplicate; it just stops being the ordinary case.
+   */
   order: z.number().int(),
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -60,11 +69,35 @@ export const Category = z.object({
 })
 export type Category = z.infer<typeof Category>
 
+/**
+ * What a person types when they add or rename a category: a name, and nothing else.
+ *
+ * `order` used to be here, optional, and it was the only way to move a category — a number field on
+ * a settings form, with a hint explaining that lower comes first and that ties fall back to names.
+ * The sequence is written by `categories.reorder` now, so an `order` on create or update would be a
+ * second way to set the same thing, disagreeing with the first the moment anybody used it.
+ */
 export const CategoryInput = z.object({
   name: z.string().trim().min(1).max(120),
-  order: z.number().int().min(0).max(9999).optional(),
 })
 export type CategoryInput = z.infer<typeof CategoryInput>
+
+/**
+ * How many categories one workspace may have live at once — and the reason it is a *stated* limit.
+ *
+ * `categories.reorder` has to name every live category exactly once, so its input array needs a
+ * bound; every zod array that a client fills does, or a single request can ask the server to hold an
+ * arbitrary list in memory. A bound on that array alone is a **silent ceiling**: a workspace with
+ * more live categories than the number could still create, rename and archive them, and only
+ * reordering would fail — the one procedure with no other way to do the job.
+ *
+ * So the same number is enforced where somebody meets it. `categories.create` and a restore both
+ * refuse with `inventory.category.limit_reached` once a workspace holds this many live categories,
+ * which is a sentence naming the number at the moment it matters. Archiving one frees a place, which
+ * is why the limit counts the **live** rows rather than every row ever made: the advice the refusal
+ * gives has to be true.
+ */
+export const MAX_LIVE_CATEGORIES = 500
 
 /**
  * One stretch of time during which one person held one asset.

@@ -66,9 +66,11 @@ three filters correctly return nothing yet.
   does not need.
 - **Categories** group what a workspace owns. They are managed in **Settings → Inventory →
   Categories**, chosen on the asset form, shown as a chip on the row, and are the list's category
-  filter. They archive rather than delete: `assets.category_id` carries no foreign key, so deleting
-  one would leave every asset filed under it pointing at nothing, and an archived category still
-  names itself on the rows that carry it.
+  filter. The order they appear in everywhere else is set by **dragging them into it** — or, without
+  a pointer, with the move-up and move-down buttons on each row, which do exactly the same thing and
+  say where the row landed. A new category joins the end. They archive rather than delete:
+  `assets.category_id` carries no foreign key, so deleting one would leave every asset filed under
+  it pointing at nothing, and an archived category still names itself on the rows that carry it.
 - Two **dashboard cards**: the most recently added assets, above a strip saying how many there are,
   how many nobody is holding and how many are away; and — for a workspace that records repairs — what
   is out for repair right now, with the tag and name of each item.
@@ -111,10 +113,10 @@ three filters correctly return nothing yet.
 - Its strings ship in the five languages the platform speaks — English, Arabic, German, Persian,
   Turkish.
 
-The API is twenty-three procedures under `/api/inventory`:
+The API is twenty-four procedures under `/api/inventory`:
 `assets.{list,get,create,update,archive,history}`,
 `custody.{assign,transfer,return,history,byUser}`,
-`categories.{list,create,update,archive}`,
+`categories.{list,create,update,archive,reorder}`,
 `repairs.{list,create,update,complete}`,
 `attachments.{list,add,remove}` and
 `stats.summary`.

@@ -399,4 +399,27 @@ describe('the platform surfaces the module declares', () => {
     for (const { type } of inventoryModule.definition.notificationTypes ?? [])
       expect({ type, sent: sources.includes(`'${type}'`) }).toEqual({ type, sent: true })
   })
+
+  /**
+   * The client manifest's `name` is read on screen, so it has to be a getter over `t`.
+   *
+   * The dashboard's widget picker heads this module's group with `mod.name` directly, and the shell's
+   * settings rail falls back to it for a module whose navigation it cannot read — so an English
+   * literal there is a Latin word sitting in an otherwise Persian panel. `name` is typed as a plain
+   * `string` on `ClientModule`, which is exactly why nothing else catches this: a literal and a
+   * getter are the same type.
+   *
+   * Read as text rather than imported, and honest about being crude. `src/client/module.ts` reaches
+   * `@kernhq/ui`, which drags a Svelte compiler into whatever imports it, and this package's vitest
+   * runs plain Node — the same reason `errors.ts` and `messages.ts` are kept importable and the
+   * components are not. It proves the shape, not the rendering.
+   */
+  it('gives the client manifest a translated name rather than an English literal', () => {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const source = readFileSync(join(here, 'client', 'module.ts'), 'utf8')
+    expect(source, 'a getter, so the language is the one on screen at read time').toMatch(
+      /get name\(\)\s*\{\s*return t\('nav'\)/,
+    )
+    expect(source, 'and no literal left beside it').not.toMatch(/^\s*name: '/m)
+  })
 })

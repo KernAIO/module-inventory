@@ -13,6 +13,7 @@ import {
   CustodyPeriod,
   CustodyResult,
   InventoryStats,
+  MAX_LIVE_CATEGORIES,
   RepairInput,
   RepairListItem,
   RepairPatchInput,
@@ -163,6 +164,34 @@ export const inventoryContract = {
       .route({ method: 'POST', path: '/categories/{categoryId}/archive', tags: t })
       .input(ws.extend({ categoryId: z.uuid(), archived: z.boolean().default(true) }))
       .output(Category),
+    /**
+     * The whole sequence, in the order somebody put it in — the only thing that writes `order`.
+     *
+     * **The ids, not positions.** A position number is a database column with a form around it: two
+     * categories can hold the same one, nobody thinks about their filing as integers, and the screen
+     * that asked for one had to explain how ties break. A list of ids says exactly what the person
+     * did, whatever they did it with — a drag, or the move-up and move-down buttons beside it.
+     *
+     * **It must name every live category the workspace has, exactly once.** A partial list is not
+     * treated as "leave the rest alone": somebody added a category in another tab while this page
+     * was open, and the ordering in hand no longer describes the workspace. Renumbering what it does
+     * name would drop the new one somewhere nobody chose, silently — so the whole call is refused
+     * with `inventory.category.order_stale` and the page reloads and asks again. Naming an archived
+     * category is the same mistake from the other side and gets the same answer; an id from another
+     * workspace is `NOT_FOUND`, exactly as `update` and `archive` answer for one.
+     *
+     * Answers the live sequence as it now stands, so a caller needs no second read.
+     *
+     * **The bound is `MAX_LIVE_CATEGORIES`, and it is the same number `create` refuses at.** A bound
+     * on this array with nothing enforcing it elsewhere is a silent ceiling: a workspace could grow
+     * past it one category at a time and then find that the only procedure that can order them is
+     * the one it can no longer call. Held to the same number at the point of creation, the array can
+     * always name every live category a workspace is allowed to have.
+     */
+    reorder: baseContract
+      .route({ method: 'POST', path: '/categories/reorder', tags: t })
+      .input(ws.extend({ categoryIds: z.array(z.uuid()).min(1).max(MAX_LIVE_CATEGORIES) }))
+      .output(z.array(Category)),
   },
 
   /**

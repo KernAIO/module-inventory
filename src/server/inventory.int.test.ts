@@ -14,11 +14,19 @@ import { drizzle } from 'drizzle-orm/node-postgres'
 import pg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { z } from 'zod'
-import type { Asset } from '../contract/models.js'
+import { type Asset, MAX_LIVE_CATEGORIES } from '../contract/models.js'
 import { inventoryModule } from './index.js'
 import { activeWorkspaces, reconcileStatuses } from './jobs.js'
 import { inventoryRouter } from './router.js'
-import { assetHistory, assets, custodyPeriods, repairs, TENANT_TABLES, workspaces } from './schema.js'
+import {
+  assetHistory,
+  assets,
+  categories as categoriesTable,
+  custodyPeriods,
+  repairs,
+  TENANT_TABLES,
+  workspaces,
+} from './schema.js'
 import { inventoryServices } from './services/index.js'
 
 /**
@@ -52,6 +60,19 @@ const WS_PAGE = workspace()
 const WS_FILTER = workspace()
 const WS_CUSTODY = workspace()
 const WS_CAT = workspace()
+/**
+ * Its own, because `reorder` insists on being handed **every** live category the workspace has —
+ * so a test sharing a workspace with the block above would be ordering whatever that block happened
+ * to have created by then, and would break the first time somebody added a case to it.
+ */
+const WS_ORDER = workspace()
+/**
+ * Its own, because the point of it is two transactions appending to the same list at the same
+ * moment — and a workspace shared with `WS_ORDER` would have its sequence rewritten underneath it.
+ */
+const WS_UNIQUE = workspace()
+/** Its own, because it fills up: every other block's `create` would be refused inside it. */
+const WS_LIMIT = workspace()
 const WS_REPAIR = workspace()
 const WS_FILES = workspace()
 const WS_STATS = workspace()
@@ -436,6 +457,26 @@ function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+/**
+ * The stable token a refusal carried, which is the half a *client* reads.
+ *
+ * The message is prose that changes when somebody rewords it; the reason is what
+ * `src/client/errors.ts` branches on to show a translated sentence instead of the server's English.
+ * Asserting on it is how a test proves a Persian reader gets Persian. Reached through `cause` and
+ * out of `data` for the same reasons `codeOf` is: `kernErrorToORPC` folds it into `data`, while a
+ * `KernError` thrown in-process carries it on itself.
+ */
+function reasonOf(err: unknown): string | null {
+  let cursor: unknown = err
+  for (let depth = 0; depth < 5 && cursor; depth++) {
+    const found =
+      (cursor as { data?: { reason?: unknown } }).data?.reason ?? (cursor as { reason?: unknown }).reason
+    if (typeof found === 'string') return found
+    cursor = (cursor as { cause?: unknown }).cause
+  }
+  return null
+}
+
 async function refusedWith(fn: () => Promise<unknown>): Promise<string> {
   try {
     await fn()
@@ -443,6 +484,19 @@ async function refusedWith(fn: () => Promise<unknown>): Promise<string> {
     const code = codeOf(err)
     if (code) return code
     throw new Error(`Rejected, but with no error code: ${String(err)}`)
+  }
+  throw new Error('Expected the call to be refused, but it succeeded')
+}
+
+/**
+ * The refusal itself, for the cases that assert more than its code — its reason token, or the
+ * sentence the server wrote. A call that succeeds is the failure, and says so.
+ */
+async function capture(fn: () => Promise<unknown>): Promise<unknown> {
+  try {
+    await fn()
+  } catch (err) {
+    return err
   }
   throw new Error('Expected the call to be refused, but it succeeded')
 }
@@ -1982,18 +2036,26 @@ describe('reading an asset’s timeline', () => {
 describe('categories', () => {
   // Lazy, for the reason spelled out above: a describe body runs before `beforeAll`.
   const ctx = () => ({ context: asUser(ALICE, WS_CAT) })
-  const create = (name: string, order?: number) =>
-    call(inv.categories.create, { workspaceId: WS_CAT, name, order }, ctx())
+  const create = (name: string) => call(inv.categories.create, { workspaceId: WS_CAT, name }, ctx())
   const list = (archived = false) => call(inv.categories.list, { workspaceId: WS_CAT, archived }, ctx())
 
-  it('orders by position and then by name, so a workspace that never reorders still gets a list', async () => {
-    // Every row has order 0 unless somebody says otherwise, so the tiebreak is doing all the work —
-    // and it has to be the name rather than the id, or the picker is in insertion order.
+  /**
+   * Every new category joins the end, so the list reads back in the order somebody typed it.
+   *
+   * It used to take an optional `order` that defaulted to **0**, which meant every category anybody
+   * added landed at the front tied with everything else, and `list`'s name tiebreak decided where —
+   * so adding "Consumables" to an arranged list dropped it between "Cameras" and "Furniture". The
+   * position is the statement's own business now (`coalesce(max(order), -1) + 1`), and no two live
+   * categories share one.
+   */
+  it('appends each new category, so the list reads back in the order it was typed', async () => {
     await create('Furniture')
     await create('Cameras')
-    await create('Laptops', 0)
-    await create('Consumables', 5)
-    expect((await list()).map((c) => c.name)).toEqual(['Cameras', 'Furniture', 'Laptops', 'Consumables'])
+    await create('Laptops')
+    await create('Consumables')
+    const rows = await list()
+    expect(rows.map((c) => c.name)).toEqual(['Furniture', 'Cameras', 'Laptops', 'Consumables'])
+    expect(new Set(rows.map((c) => c.order)).size, 'and no two of them share a place').toBe(rows.length)
   })
 
   it('refuses a duplicate name with a sentence naming it, not a 500', async () => {
@@ -2110,6 +2172,479 @@ describe('categories', () => {
     CHANGES.length = 0
     await create('Also announced correctly')
     expect(CHANGES.map((c) => c.entity)).toEqual(['category'])
+  })
+})
+
+/**
+ * Putting the categories in order — the one procedure that writes `order`, and the four ways it
+ * refuses.
+ *
+ * The settings page used to ask an administrator to type a **position number**, with a hint
+ * explaining that lower comes first and that two categories sharing a number fall back to their
+ * names. It is a list somebody drags now, and a drag produces a sequence of ids rather than an
+ * arithmetic problem — so the contract takes the ids and the server renumbers the live set `0…n-1`
+ * inside one transaction.
+ *
+ * Every refusal below exists because the alternative is a silent wrong answer. A list that leaves a
+ * category out is not an instruction to leave it alone: it is an ordering of a workspace that no
+ * longer exists, and completing it would drop the missing category wherever its stale number
+ * happened to land, without telling anybody. The client's answer to the conflict is to reload and
+ * ask again, which is why the reason token is asserted and not just the code — that token is the
+ * only part of a refusal a Persian reader ever sees translated.
+ */
+describe('putting the categories in order', () => {
+  const ctx = () => ({ context: asUser(ALICE, WS_ORDER) })
+  const create = (name: string) => call(inv.categories.create, { workspaceId: WS_ORDER, name }, ctx())
+  const list = (archived = false) => call(inv.categories.list, { workspaceId: WS_ORDER, archived }, ctx())
+  const reorder = (categoryIds: string[]) =>
+    call(inv.categories.reorder, { workspaceId: WS_ORDER, categoryIds }, ctx())
+  const names = async () => (await list()).map((c) => c.name)
+
+  it('renumbers the whole sequence from the ids it was handed', async () => {
+    await create('Desks')
+    await create('Chairs')
+    await create('Lamps')
+    expect(await names(), 'appended, so this is the order they were typed in').toEqual([
+      'Desks',
+      'Chairs',
+      'Lamps',
+    ])
+
+    const ids = (await list()).map((c) => c.id)
+    const answered = await reorder([ids[2] as string, ids[0] as string, ids[1] as string])
+    expect(answered.map((c) => c.name)).toEqual(['Lamps', 'Desks', 'Chairs'])
+    expect(
+      answered.map((c) => c.order),
+      'contiguous from zero, with no ties left behind',
+    ).toEqual([0, 1, 2])
+    expect(await names(), 'and the next read agrees').toEqual(['Lamps', 'Desks', 'Chairs'])
+  })
+
+  it('refuses a list naming a category from another workspace, and writes nothing', async () => {
+    const theirs = await call(
+      inv.categories.create,
+      { workspaceId: WS_B, name: 'Not ours to order' },
+      { context: asUser(BOB, WS_B) },
+    )
+    const ids = (await list()).map((c) => c.id)
+    // Permuted as well as poisoned: if the renumbering ran before the check, the order would move.
+    expect(
+      await refusedWith(() => reorder([ids[1] as string, ids[0] as string, ids[2] as string, theirs.id])),
+      'a category this workspace does not have is missing, not forbidden',
+    ).toBe('NOT_FOUND')
+    expect(await names(), 'nothing was written').toEqual(['Lamps', 'Desks', 'Chairs'])
+
+    // And the other workspace's own category was not renumbered on the way past.
+    const theirsAfter = await call(
+      inv.categories.list,
+      { workspaceId: WS_B, archived: true },
+      { context: asUser(BOB, WS_B) },
+    )
+    expect(theirsAfter.find((c) => c.id === theirs.id)?.order).toBe(theirs.order)
+  })
+
+  it('refuses a list that leaves out a category added while the page was open', async () => {
+    const ids = (await list()).map((c) => c.id)
+    // The other tab.
+    await create('Shelves')
+
+    const attempt = () => reorder([ids[1] as string, ids[0] as string, ids[2] as string])
+    expect(await refusedWith(attempt)).toBe('CONFLICT')
+    await expect(attempt()).rejects.toSatisfy(
+      (err: unknown) => reasonOf(err) === 'inventory.category.order_stale',
+    )
+    expect(
+      await names(),
+      'refused whole: renumbering three of four would have moved Shelves nowhere anybody chose',
+    ).toEqual(['Lamps', 'Desks', 'Chairs', 'Shelves'])
+  })
+
+  it('refuses a list naming a category archived while the page was open', async () => {
+    const ids = (await list()).map((c) => c.id)
+    const shelves = ids[3] as string
+    await call(inv.categories.archive, { workspaceId: WS_ORDER, categoryId: shelves, archived: true }, ctx())
+
+    await expect(reorder([...ids].reverse())).rejects.toSatisfy(
+      (err: unknown) => codeOf(err) === 'CONFLICT' && reasonOf(err) === 'inventory.category.order_stale',
+    )
+    expect(await names()).toEqual(['Lamps', 'Desks', 'Chairs'])
+
+    // Restored, it joins the end rather than landing back on the number it left with — which, after
+    // three renumberings, belongs to somebody else.
+    await call(inv.categories.archive, { workspaceId: WS_ORDER, categoryId: shelves, archived: false }, ctx())
+    const back = await list()
+    expect(back.map((c) => c.name)).toEqual(['Lamps', 'Desks', 'Chairs', 'Shelves'])
+    expect(new Set(back.map((c) => c.order)).size).toBe(back.length)
+  })
+
+  it('refuses a list that names the same category twice', async () => {
+    const ids = (await list()).map((c) => c.id)
+    expect(await refusedWith(() => reorder([ids[0] as string, ...ids]))).toBe('BAD_REQUEST')
+    expect(await names()).toEqual(['Lamps', 'Desks', 'Chairs', 'Shelves'])
+  })
+
+  it('announces the rows that moved, and stays silent about the ones that did not', async () => {
+    const ids = (await list()).map((c) => c.id)
+    const swapped = [ids[0] as string, ids[1] as string, ids[3] as string, ids[2] as string]
+
+    CHANGES.length = 0
+    await reorder(swapped)
+    expect(new Set(CHANGES.map((c) => c.entity)), 'a category changed, not an asset').toEqual(
+      new Set(['category']),
+    )
+    expect(
+      CHANGES.map((c) => c.id).sort(),
+      'only the two that swapped — telling every open screen about the other two would describe a write nobody performed',
+    ).toEqual([ids[2] as string, ids[3] as string].sort())
+
+    CHANGES.length = 0
+    await reorder(swapped)
+    expect(CHANGES, 'the same order again moves nothing and announces nothing').toEqual([])
+  })
+
+  /**
+   * Two reorders arriving at once, driven through two transactions held open rather than raced for.
+   *
+   * A `Promise.all` on one event loop usually serialises on a laptop and proves nothing; this is the
+   * interleaving a busy instance produces. B is only released once Postgres says it is *waiting on a
+   * lock*, which is the honest signal that its `select … for update` has queued behind A rather than
+   * having run before it.
+   *
+   * The `for update` is the whole subject. Without it both transactions read the same list, both
+   * pass the completeness check, and their per-row updates land interleaved — leaving a sequence
+   * that is neither of the two orders anybody asked for, with two categories on the same number.
+   * With it, the second one waits, re-reads what the first committed and writes its own ordering on
+   * top: last in wins, whole.
+   */
+  it('lets two reorders arriving at once settle one after the other, never half of each', async () => {
+    const svc = inventoryServices(kernel)
+    const ids = (await list()).map((c) => c.id)
+    const first = [...ids].reverse()
+    const second = [ids[2] as string, ids[0] as string, ids[3] as string, ids[1] as string]
+
+    let aHasLocked!: () => void
+    const locked = new Promise<void>((resolve) => {
+      aHasLocked = resolve
+    })
+    let commitA!: () => void
+    const holdA = new Promise<void>((resolve) => {
+      commitA = resolve
+    })
+
+    const a = kernel.database.withWorkspace(
+      WS_ORDER,
+      async (tx) => {
+        await svc.categories.reorder(tx, WS_ORDER, first)
+        aHasLocked()
+        await holdA
+      },
+      { userId: ALICE },
+    )
+    await locked
+
+    const b = kernel.database.withWorkspace(WS_ORDER, (tx) => svc.categories.reorder(tx, WS_ORDER, second), {
+      userId: BOB,
+    })
+    // Attached now, so a rejection is never an unhandled one while the poll below runs.
+    const bSettled = b.then(
+      () => null,
+      (err: unknown) => err,
+    )
+
+    await waitForBlockedBackend()
+    commitA()
+    await a
+    expect(await bSettled, 'both orderings are valid; the second simply waits its turn').toBeNull()
+
+    const after = await list()
+    expect(
+      after.map((c) => c.id),
+      'the last one in wins, and wins whole',
+    ).toEqual(second)
+    expect(after.map((c) => c.order)).toEqual([0, 1, 2, 3])
+  })
+})
+
+/**
+ * The claim that no two live categories share a place, held to by the database rather than by care.
+ *
+ * The contract said it, the changeset said it and `list`'s own comment said it — and all three were
+ * describing an intention. A category joins the end of the list by taking
+ * `(select coalesce(max("order"), -1) + 1)`, and a restore appends the same way; putting that
+ * subquery *inside* the write removes a round trip and removes no race at all. Under READ COMMITTED
+ * each statement takes its own snapshot, so two transactions appending at the same instant both read
+ * a list without the other's row in it and both take the same number. `reorder`'s `select … for
+ * update` serialises neither of them: a row lock cannot cover a row that does not exist yet.
+ *
+ * Measured before the fix, against this exact block: three live categories on two distinct numbers
+ * after two creates, and five on three after a create raced a restore.
+ *
+ * Two things make the sentence true now, and they answer different questions. The **advisory lock**
+ * per workspace is what makes the ordinary append correct — the second caller waits, re-reads and
+ * takes the next number, so nobody is refused for pressing a button at an unlucky moment. The
+ * **partial unique index** is what makes the claim hold whatever else ever reaches the table.
+ */
+describe('two live categories can never share a place', () => {
+  const ctx = () => ({ context: asUser(ALICE, WS_UNIQUE) })
+  const create = (name: string) => call(inv.categories.create, { workspaceId: WS_UNIQUE, name }, ctx())
+  const live = () => call(inv.categories.list, { workspaceId: WS_UNIQUE, archived: false }, ctx())
+
+  /**
+   * Two appends driven through two transactions held open, rather than raced for.
+   *
+   * A `Promise.all` on one event loop usually serialises on a laptop and proves nothing. B is only
+   * released once Postgres says a backend is *waiting on a lock*, which is the honest signal that it
+   * has queued behind A rather than having run before it — the same shape as the two-reorder test
+   * above, and the reason this cannot pass by luck.
+   */
+  async function bothAppendAtOnce(firstName: string, second: (tx: Tx) => Promise<unknown>) {
+    const svc = inventoryServices(kernel)
+    let aHasWritten!: () => void
+    const written = new Promise<void>((resolve) => {
+      aHasWritten = resolve
+    })
+    let commitA!: () => void
+    const holdA = new Promise<void>((resolve) => {
+      commitA = resolve
+    })
+
+    const a = kernel.database.withWorkspace(
+      WS_UNIQUE,
+      async (tx) => {
+        const row = await svc.categories.create(tx, WS_UNIQUE, firstName)
+        aHasWritten()
+        await holdA
+        return row
+      },
+      { userId: ALICE },
+    )
+    await written
+
+    const b = kernel.database.withWorkspace(WS_UNIQUE, second, { userId: BOB })
+    // Attached now, so a rejection is never an unhandled one while the poll below runs.
+    const bSettled = b.then(
+      () => null,
+      (err: unknown) => err,
+    )
+
+    await waitForBlockedBackend()
+    commitA()
+    await a
+    return bSettled
+  }
+
+  it('gives two creates that append at the same instant two different places', async () => {
+    await create('Already here')
+    const svc = inventoryServices(kernel)
+
+    const refusal = await bothAppendAtOnce('Raced in first', (tx) =>
+      svc.categories.create(tx, WS_UNIQUE, 'Raced in second'),
+    )
+    expect(refusal, 'the second waits for the first and then appends properly — nobody is refused').toBeNull()
+
+    const rows = await live()
+    expect(new Set(rows.map((c) => c.order)).size, 'every live place is its own').toBe(rows.length)
+    expect(rows.map((c) => c.name)).toEqual(['Already here', 'Raced in first', 'Raced in second'])
+  })
+
+  it('gives a restore racing a create the place after it, not the same one', async () => {
+    const parked = await create('Archived, and coming back')
+    await call(
+      inv.categories.archive,
+      { workspaceId: WS_UNIQUE, categoryId: parked.id, archived: true },
+      ctx(),
+    )
+    const svc = inventoryServices(kernel)
+
+    // A restore appends exactly as a create does, and used to read the same stale maximum.
+    const refusal = await bothAppendAtOnce('Raced past a restore', (tx) =>
+      svc.categories.archive(tx, WS_UNIQUE, parked.id, false),
+    )
+    expect(refusal, 'a restore appends too, and waits its turn the same way').toBeNull()
+
+    const rows = await live()
+    expect(new Set(rows.map((c) => c.order)).size, 'every live place is its own').toBe(rows.length)
+    expect(rows.at(-1)?.name, 'the restore came last, so it is last').toBe('Archived, and coming back')
+  })
+
+  /**
+   * The index itself, asked directly — because the lock above is what keeps the ordinary path off it,
+   * and a guard nothing ever reaches is a guard nobody can tell is missing.
+   */
+  it('refuses two live rows on one number, whatever writes them', async () => {
+    const rows = await live()
+    const first = rows[0]!
+    const second = rows[1]!
+    const name = await constraintViolated(() =>
+      kernel.database.withWorkspace(
+        WS_UNIQUE,
+        (tx) =>
+          tx
+            .update(categoriesTable)
+            .set({ order: first.order })
+            .where(and(eq(categoriesTable.workspaceId, WS_UNIQUE), eq(categoriesTable.id, second.id))),
+        { userId: ALICE },
+      ),
+    )
+    expect(name).toBe('inventory_categories_ws_order_live_uq')
+  })
+
+  /**
+   * And the index is *partial*, which is the half a total unique index would get wrong: an archived
+   * row keeps the number it had when it left, and a live row is renumbered onto it by the very next
+   * reorder. That is not a collision anybody can see — an archived category is in no picker, no
+   * filter and no sequence — so the index must not refuse it.
+   */
+  it('lets an archived category keep a number a live one now holds', async () => {
+    const rows = await live()
+    const first = rows[0]
+    expect(first, 'the block above left at least one live category').toBeDefined()
+    await call(
+      inv.categories.archive,
+      { workspaceId: WS_UNIQUE, categoryId: first!.id, archived: true },
+      ctx(),
+    )
+
+    const remaining = (await live()).map((c) => c.id)
+    await call(inv.categories.reorder, { workspaceId: WS_UNIQUE, categoryIds: remaining }, ctx())
+
+    const all = await call(inv.categories.list, { workspaceId: WS_UNIQUE, archived: true }, ctx())
+    const archivedRow = all.find((c) => c.id === first!.id)
+    expect(archivedRow?.archivedAt, 'still archived').not.toBeNull()
+    const stillLive = all.filter((c) => !c.archivedAt)
+    expect(
+      stillLive.map((c) => c.order),
+      'renumbered from zero, and free to reuse the number the archived row is sitting on',
+    ).toEqual(stillLive.map((_c, i) => i))
+    expect(
+      stillLive.some((c) => c.order === archivedRow?.order),
+      'a live row really is sitting on the archived one’s number',
+    ).toBe(true)
+  })
+
+  /**
+   * A swap is the commonest reorder there is, and it is the one a plain unique index refuses.
+   *
+   * Postgres checks a unique *index* row by row rather than at the end of the statement, and there is
+   * no deferrable form to reach for — a unique constraint can be deferred and cannot be partial. So
+   * `reorder` parks every moving row above the sequence first and puts them down afterwards. Without
+   * that, this test is a 23505 during an entirely ordinary drag.
+   */
+  it('swaps two neighbours without ever colliding on the way', async () => {
+    const before = (await live()).map((c) => c.id)
+    expect(before.length, 'a swap needs two').toBeGreaterThan(1)
+    const swapped = [before[1]!, before[0]!, ...before.slice(2)]
+
+    const answered = await call(
+      inv.categories.reorder,
+      { workspaceId: WS_UNIQUE, categoryIds: swapped },
+      ctx(),
+    )
+    expect(answered.map((c) => c.id)).toEqual(swapped)
+    expect(answered.map((c) => c.order)).toEqual(swapped.map((_id, i) => i))
+  })
+
+  /**
+   * And the whole sequence reversed, which parks and lands every row in the list at once.
+   *
+   * The parking values have to clear both the highest number any row holds *and* the last place in
+   * the new sequence; a base that only cleared the first collides the moment a workspace's numbers
+   * are sparser than its row count.
+   */
+  it('reverses the whole list in one call', async () => {
+    const before = (await live()).map((c) => c.id)
+    const reversed = [...before].reverse()
+
+    const answered = await call(
+      inv.categories.reorder,
+      { workspaceId: WS_UNIQUE, categoryIds: reversed },
+      ctx(),
+    )
+    expect(answered.map((c) => c.id)).toEqual(reversed)
+    expect(answered.map((c) => c.order)).toEqual(reversed.map((_id, i) => i))
+  })
+})
+
+/**
+ * The ceiling, and the fact that it is stated somewhere rather than only implied.
+ *
+ * `categories.reorder` is handed every live category at once, so its input array carries a bound —
+ * every zod array a client fills has to, or one request can ask the server to hold an arbitrary list.
+ * A bound on the array *alone* is a silent ceiling: a workspace could pass it one category at a time,
+ * because nothing else counted, and the first sign would be that the only procedure able to order
+ * them refuses every call. Nothing on the screen would say why, and there is no other way to reorder.
+ *
+ * So the same constant is enforced where somebody meets it, at the moment they meet it, with a
+ * sentence carrying the number. The two halves are asserted together below, because they are only
+ * worth anything as a pair: the limit is reachable by creating, and a workspace sitting exactly on it
+ * can still reorder every category it has.
+ */
+describe('the number of categories a workspace can keep', () => {
+  const ctx = () => ({ context: asUser(ALICE, WS_LIMIT) })
+  const create = (name: string) => call(inv.categories.create, { workspaceId: WS_LIMIT, name }, ctx())
+
+  beforeAll(async () => {
+    // Filled with one statement rather than 500 calls: what is under test is the count, not the path
+    // that produced it, and 500 round trips through the router would dominate this file's runtime.
+    await kernel.database.withWorkspace(
+      WS_LIMIT,
+      (tx) =>
+        tx.execute(sql`
+          insert into mod_inventory.categories (workspace_id, name, "order")
+          select ${WS_LIMIT}::uuid, 'Filler ' || n, n - 1
+            from generate_series(1, ${MAX_LIVE_CATEGORIES}) as n
+        `),
+      { userId: ALICE },
+    )
+  }, 60_000)
+
+  it('refuses the one past it, and says what to do about it', async () => {
+    const refusal = await capture(() => create('One too many'))
+    expect(codeOf(refusal)).toBe('CONFLICT')
+    expect(reasonOf(refusal), 'a token, because the sentence a Persian reader sees is the client’s own').toBe(
+      'inventory.category.limit_reached',
+    )
+    expect(messageOf(refusal), 'and the server names the number rather than hinting at one').toContain(
+      String(MAX_LIVE_CATEGORIES),
+    )
+  })
+
+  it('still lets a workspace sitting on the limit order every category it has', async () => {
+    // The whole point of holding the two to one number: the bound on the array is never the thing a
+    // real workspace runs into first.
+    const rows = await call(inv.categories.list, { workspaceId: WS_LIMIT, archived: false }, ctx())
+    expect(rows).toHaveLength(MAX_LIVE_CATEGORIES)
+    const reordered = [rows.at(-1)!.id, ...rows.slice(0, -1).map((c) => c.id)]
+    const answered = await call(
+      inv.categories.reorder,
+      { workspaceId: WS_LIMIT, categoryIds: reordered },
+      ctx(),
+    )
+    expect(answered.map((c) => c.id)).toEqual(reordered)
+    expect(new Set(answered.map((c) => c.order)).size, 'and no two share a place').toBe(MAX_LIVE_CATEGORIES)
+  })
+
+  it('makes room when one is archived, which is what the refusal tells the reader to do', async () => {
+    const rows = await call(inv.categories.list, { workspaceId: WS_LIMIT, archived: false }, ctx())
+    await call(
+      inv.categories.archive,
+      { workspaceId: WS_LIMIT, categoryId: rows[0]!.id, archived: true },
+      ctx(),
+    )
+    const added = await create('Fits now')
+    expect(added.name).toBe('Fits now')
+
+    // And the freed place cannot be taken twice: restoring the archived one is refused in turn.
+    const refusal = await capture(() =>
+      call(
+        inv.categories.archive,
+        { workspaceId: WS_LIMIT, categoryId: rows[0]!.id, archived: false },
+        ctx(),
+      ),
+    )
+    expect(reasonOf(refusal), 'a restore grows the live set too, so it is held to the same number').toBe(
+      'inventory.category.limit_reached',
+    )
   })
 })
 

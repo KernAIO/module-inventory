@@ -545,6 +545,14 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
     return category
   }
 
+  /**
+   * One past the highest position in use, archived rows counted — the server's `appended()`.
+   *
+   * Archived rows count because one of them can be restored, and a restored category landing on a
+   * live one's number is the tie that made a "Position" field a bad idea in the first place.
+   */
+  const appendedOrder = () => categories.reduce((max, c) => Math.max(max, c.order), -1) + 1
+
   const openPeriodFor = (id: string) =>
     periods.find((period) => period.assetId === id && period.effectiveTo === null)
 
@@ -766,15 +774,7 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
           .map(stamp)
       },
 
-      create: async ({
-        workspaceId,
-        name,
-        order = 0,
-      }: {
-        workspaceId: string
-        name: string
-        order?: number
-      }) => {
+      create: async ({ workspaceId, name }: { workspaceId: string; name: string }) => {
         remember(workspaceId)
         // The server's unique index is what actually decides, and it answers a duplicate with a
         // sentence rather than a 500. The demo answers the same way.
@@ -789,7 +789,9 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
           id: categoryId(),
           workspaceId: '' as Asset['workspaceId'],
           name,
-          order,
+          // Appended, like the server: a new category joins the end of the sequence rather than
+          // landing at the front tied with whatever is already there.
+          order: appendedOrder(),
           createdAt: now,
           updatedAt: now,
           archivedAt: null,
@@ -806,7 +808,6 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
         workspaceId?: string
         categoryId: string
         name?: string
-        order?: number
       }) => {
         remember(workspaceId)
         const category = findCategory(id)
@@ -832,9 +833,47 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
         remember(workspaceId)
         const category = findCategory(id)
         // Nothing deletes: an asset filed under this category keeps naming it.
-        category.archivedAt = archived === false ? null : new Date().toISOString()
+        const restoring = archived === false
+        category.archivedAt = restoring ? null : new Date().toISOString()
+        // A restore appends, like the server: the position it left with belongs to somebody else by
+        // now, and the end of the list is the one place a person can find it again.
+        if (restoring) category.order = appendedOrder()
         category.updatedAt = new Date().toISOString()
         return stamp(category)
+      },
+
+      /**
+       * The sequence, rewritten from the ids — and the two refusals the server makes, because a
+       * demo that cannot reproduce them is a demo of the happy path.
+       *
+       * An id this workspace does not have is `NOT_FOUND`; a list that does not name every live
+       * category exactly once is the stale conflict, reason and all, so the settings page's rollback
+       * can be exercised without a server.
+       */
+      reorder: async ({ workspaceId, categoryIds }: { workspaceId?: string; categoryIds: string[] }) => {
+        remember(workspaceId)
+        const named = new Set(categoryIds)
+        if (named.size !== categoryIds.length)
+          throw new MockApiError('BAD_REQUEST', 'That list of categories names the same one more than once.')
+        for (const id of categoryIds) findCategory(id)
+        const live = categories.filter((category) => !category.archivedAt)
+        if (
+          live.some((category) => !named.has(category.id)) ||
+          categoryIds.some((id) => findCategory(id).archivedAt)
+        )
+          throw new MockApiError(
+            'CONFLICT',
+            'The categories changed while this list was open, so this order was not saved. Reload the list and arrange it again.',
+            'inventory.category.order_stale',
+          )
+        const now = new Date().toISOString()
+        for (const [index, id] of categoryIds.entries()) {
+          const category = findCategory(id)
+          if (category.order === index) continue
+          category.order = index
+          category.updatedAt = now
+        }
+        return categoryIds.map((id) => stamp(findCategory(id)))
       },
     },
 

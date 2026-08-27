@@ -2,6 +2,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
+import { MAX_LIVE_CATEGORIES } from '../contract/models.js'
 import {
   codeOf,
   errorLine,
@@ -202,6 +203,35 @@ describe('which sentence a refusal earns', () => {
     expect(errorMessage(conflict('inventory.custody.not_held'), (key) => `<${key}>`)).toBe(
       '<error_custody_not_held>',
     )
+  })
+
+  /**
+   * The one refusal whose sentence has a number in it.
+   *
+   * A limit that will not say what it is cannot be planned around, and `KernError.conflict` carries a
+   * reason and no data — so the figure comes from the contract, which is the same constant the server
+   * enforces. Passed through `t`, which puts it through `Intl.NumberFormat`, so the reader sees it in
+   * their own digits rather than in ASCII.
+   */
+  it('hands the category limit its number, from the constant the server enforces', () => {
+    const refusal = conflict('inventory.category.limit_reached')
+    expect(errorLine(refusal)).toEqual({
+      key: 'error_category_limit_reached',
+      detail: null,
+      values: { max: MAX_LIVE_CATEGORIES },
+    })
+    expect(
+      errorMessage(refusal, (key, values) => `${key}:${JSON.stringify(values ?? null)}`),
+      'and the screen is handed the values along with the key',
+    ).toBe(`error_category_limit_reached:{"max":${MAX_LIVE_CATEGORIES}}`)
+    expect(en['inventory.error_category_limit_reached'], 'which the sentence really asks for').toContain(
+      '{max}',
+    )
+  })
+
+  it('leaves values off every key that has no placeholder', () => {
+    expect(errorLine(conflict('inventory.category.order_stale')).values).toBeUndefined()
+    expect(errorLine({ code: 'NOT_FOUND' }).values).toBeUndefined()
   })
 })
 

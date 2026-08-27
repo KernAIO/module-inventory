@@ -128,13 +128,22 @@ export const en: Record<string, Message> = {
   'inventory.category_new': 'New category',
   'inventory.category_edit': 'Edit category',
   'inventory.category_name_placeholder': 'Laptops, Furniture, Cameras…',
-  'inventory.category_order': 'Position',
-  'inventory.category_order_hint':
-    'Lower comes first. Categories sharing a position fall back to their names.',
-  // A hint and an error are not the same sentence. This field passed the hint as both, so typing
-  // "x" restated how positions sort — in red, under a field whose problem was that it held no
-  // number. An error says what is wrong with what is there.
-  'inventory.category_order_invalid': 'Use a whole number from 0 to 9999',
+  // This was a **Position** field: a number box, and a hint explaining that lower comes first and
+  // that two categories sharing a number fall back to their names. That is a database column with a
+  // form around it. Nobody arranges their filing by integer, and the form invited the one state it
+  // then had to explain. The order is dragged now, so the words are about the gesture — and about
+  // the buttons beside it, because a drag is unreachable by keyboard.
+  'inventory.category_reorder_hint':
+    'Drag a category, or use the arrows on its row, to change the order they appear in.',
+  'inventory.category_move_up': 'Move {name} up',
+  'inventory.category_move_down': 'Move {name} down',
+  // What a screen reader is told after a move — "after Cameras", never "position 3 of 9". A
+  // neighbour's name is the thing that says where something is; a number is two more facts to hold
+  // in your head to work out the same answer. Worded as where it *is* rather than what just
+  // happened, so pressing the button on a row that cannot move any further is still true.
+  'inventory.category_position_first': '{name} is first',
+  'inventory.category_position_last': '{name} is last',
+  'inventory.category_position_after': '{name} is after {other}',
   'inventory.category_created_toast': '{name} added',
   'inventory.category_updated_toast': '{name} saved',
   'inventory.category_archived_toast': '{name} archived',
@@ -312,6 +321,27 @@ export const en: Record<string, Message> = {
   'inventory.error_repair_returned_before_sent':
     'A repair cannot come back before it was sent. Check the two dates.',
   'inventory.error_category_name_taken': 'This workspace already has a category with that name.',
+  // The refusal a reorder earns when somebody added, archived or restored a category in another tab
+  // while this page was open. The list in hand no longer describes the workspace, so the server
+  // refuses the whole thing rather than renumbering what it was given and dropping the rest
+  // somewhere nobody chose.
+  //
+  // Three facts, in the order somebody needs them: what happened, that **this arrangement was not
+  // saved**, and that the list on screen is the current one. The middle one used to be missing, and
+  // the sentence went straight from "somebody changed the categories" to "put them in order again"
+  // — which reads as though the drag had landed and only needed repeating. It also said the list had
+  // been refreshed while the screen was still holding the very list the server had refused, so
+  // repeating the drag earned the same refusal for ever. `reseed` is what makes the last clause true.
+  'inventory.error_category_order_stale':
+    'Somebody else changed the categories while this page was open, so this order was not saved. The list below has been refreshed — arrange it again.',
+  // A stated ceiling rather than a silent one. `categories.reorder` is handed every live category at
+  // once, so its input array has a bound; leaving the bound only there would let a workspace grow
+  // past it one category at a time and then find the only procedure that can order them refusing to
+  // run. The number is `MAX_LIVE_CATEGORIES` from the contract, passed through `t` so it is written
+  // in the reader's own digits — and archiving really does make room, because the limit counts the
+  // live rows.
+  'inventory.error_category_limit_reached':
+    'A workspace can keep {max} categories at once, and this one has them all. Archive one it no longer uses to make room.',
   // The classes of failure, for a refusal carrying no reason of its own. A capability switched off
   // answers 404 rather than 403 — that is the module contract — so it lands on `not_found`, which
   // is the right sentence for it: the surface is not there any more, look again.
@@ -437,9 +467,14 @@ export const fa: Record<string, Message> = {
   'inventory.category_new': 'دستهٔ جدید',
   'inventory.category_edit': 'ویرایش دسته‌بندی',
   'inventory.category_name_placeholder': 'لپ‌تاپ، مبلمان، دوربین…',
-  'inventory.category_order': 'ترتیب',
-  'inventory.category_order_hint': 'عدد کمتر جلوتر می‌آید. دسته‌هایی با ترتیب یکسان بر اساس نام مرتب می‌شوند.',
-  'inventory.category_order_invalid': 'عددی درست از ۰ تا ۹۹۹۹ وارد کنید',
+  // فارسی جمله را با هدف آغاز می‌کند، نه با کنش — برعکس انگلیسی.
+  'inventory.category_reorder_hint':
+    'برای تغییر ترتیب نمایش، دسته‌بندی را بکشید یا از پیکان‌های همان ردیف استفاده کنید.',
+  'inventory.category_move_up': 'انتقال {name} به بالا',
+  'inventory.category_move_down': 'انتقال {name} به پایین',
+  'inventory.category_position_first': '{name} در ابتدای فهرست است',
+  'inventory.category_position_last': '{name} در انتهای فهرست است',
+  'inventory.category_position_after': '{name} پس از {other} است',
   'inventory.category_created_toast': '{name} افزوده شد',
   'inventory.category_updated_toast': '{name} ذخیره شد',
   'inventory.category_archived_toast': '{name} بایگانی شد',
@@ -584,6 +619,11 @@ export const fa: Record<string, Message> = {
   'inventory.error_repair_returned_before_sent':
     'تعمیر نمی‌تواند پیش از فرستاده‌شدن بازگردد. دو تاریخ را بررسی کنید.',
   'inventory.error_category_name_taken': 'این فضای کاری از پیش دسته‌بندی‌ای با این نام دارد.',
+  // فارسی جمله را با زمان آغاز می‌کند، نه با فاعل — برعکس انگلیسی.
+  'inventory.error_category_order_stale':
+    'هنگامی که این صفحه باز بود، کس دیگری دسته‌بندی‌ها را تغییر داد؛ بنابراین این ترتیب ذخیره نشد. فهرست زیر تازه شده است — دوباره مرتبش کنید.',
+  'inventory.error_category_limit_reached':
+    'هر فضای کاری هم‌زمان می‌تواند {max} دسته‌بندی داشته باشد و این فضا همه را دارد. برای باز شدن جا، دسته‌بندی‌ای را که دیگر به کار نمی‌آید بایگانی کنید.',
   'inventory.error_not_found':
     'آن دیگر آنجا نیست. شاید کسی حذف یا بایگانی‌اش کرده باشد — صفحه را دوباره بارگذاری کنید.',
   'inventory.error_forbidden': 'اجازهٔ این کار را ندارید.',
@@ -703,9 +743,12 @@ export const ar: Record<string, Message> = {
   'inventory.category_new': 'فئة جديدة',
   'inventory.category_edit': 'تعديل الفئة',
   'inventory.category_name_placeholder': 'حواسيب، أثاث، كاميرات…',
-  'inventory.category_order': 'الترتيب',
-  'inventory.category_order_hint': 'الأصغر يأتي أولًا. الفئات المتساوية تُرتَّب بأسمائها.',
-  'inventory.category_order_invalid': 'أدخل عددًا صحيحًا من ٠ إلى ٩٩٩٩',
+  'inventory.category_reorder_hint': 'اسحب فئة أو استخدم السهمين في صفّها لتغيير ترتيب ظهورها.',
+  'inventory.category_move_up': 'نقل {name} إلى الأعلى',
+  'inventory.category_move_down': 'نقل {name} إلى الأسفل',
+  'inventory.category_position_first': '{name} في أول القائمة',
+  'inventory.category_position_last': '{name} في آخر القائمة',
+  'inventory.category_position_after': '{name} بعد {other}',
   'inventory.category_created_toast': 'تمت إضافة {name}',
   'inventory.category_updated_toast': 'تم حفظ {name}',
   'inventory.category_archived_toast': 'تمت أرشفة {name}',
@@ -851,6 +894,10 @@ export const ar: Record<string, Message> = {
   'inventory.error_repair_already_complete': 'سُجّل هذا الإصلاح منتهيًا بالفعل.',
   'inventory.error_repair_returned_before_sent': 'لا يمكن أن يعود الإصلاح قبل إرساله. راجع التاريخين.',
   'inventory.error_category_name_taken': 'في مساحة العمل هذه فئة بهذا الاسم بالفعل.',
+  'inventory.error_category_order_stale':
+    'غيّر شخص آخر الفئات بينما كانت هذه الصفحة مفتوحة، فلم يُحفَظ هذا الترتيب. القائمة أدناه محدَّثة — أعد ترتيبها.',
+  'inventory.error_category_limit_reached':
+    'يمكن لمساحة العمل أن تضم {max} فئة في وقت واحد، وهذه المساحة بلغت العدد. أرشِف فئة لم تعد تُستعمَل لتوفير مكان.',
   'inventory.error_not_found': 'لم يعد ذلك موجودًا. ربما أزاله أحدهم أو أرشفه — أعد تحميل الصفحة لترى.',
   'inventory.error_forbidden': 'لا تملك صلاحية القيام بذلك.',
   'inventory.error_module_disabled': 'وحدة الأصول مُطفأة في مساحة العمل هذه.',
@@ -963,9 +1010,13 @@ export const de: Record<string, Message> = {
   'inventory.category_new': 'Neue Kategorie',
   'inventory.category_edit': 'Kategorie bearbeiten',
   'inventory.category_name_placeholder': 'Laptops, Möbel, Kameras…',
-  'inventory.category_order': 'Position',
-  'inventory.category_order_hint': 'Kleinere Zahlen stehen vorn. Bei gleicher Position entscheidet der Name.',
-  'inventory.category_order_invalid': 'Ganze Zahl von 0 bis 9999 eingeben',
+  'inventory.category_reorder_hint':
+    'Ziehen Sie eine Kategorie oder nutzen Sie die Pfeile in ihrer Zeile, um die Reihenfolge zu ändern.',
+  'inventory.category_move_up': '{name} nach oben schieben',
+  'inventory.category_move_down': '{name} nach unten schieben',
+  'inventory.category_position_first': '{name} steht an erster Stelle',
+  'inventory.category_position_last': '{name} steht an letzter Stelle',
+  'inventory.category_position_after': '{name} steht hinter {other}',
   'inventory.category_created_toast': '{name} hinzugefügt',
   'inventory.category_updated_toast': '{name} gespeichert',
   'inventory.category_archived_toast': '{name} archiviert',
@@ -1124,6 +1175,10 @@ export const de: Record<string, Message> = {
     'Eine Reparatur kann nicht vor der Abgabe zurückkommen. Prüfen Sie die beiden Daten.',
   'inventory.error_category_name_taken':
     'In diesem Workspace gibt es bereits eine Kategorie mit diesem Namen.',
+  'inventory.error_category_order_stale':
+    'Jemand anderes hat die Kategorien geändert, während diese Seite offen war — diese Reihenfolge wurde nicht gespeichert. Die Liste unten ist wieder aktuell; ordnen Sie sie erneut.',
+  'inventory.error_category_limit_reached':
+    'Ein Workspace kann {max} Kategorien gleichzeitig führen, und dieser hat sie alle. Archivieren Sie eine, die nicht mehr gebraucht wird, um Platz zu schaffen.',
   'inventory.error_not_found':
     'Das ist nicht mehr da. Vielleicht hat es jemand entfernt oder archiviert — laden Sie die Seite neu.',
   'inventory.error_forbidden': 'Dazu sind Sie nicht berechtigt.',
@@ -1246,9 +1301,13 @@ export const tr: Record<string, Message> = {
   'inventory.category_new': 'Yeni kategori',
   'inventory.category_edit': 'Kategoriyi düzenle',
   'inventory.category_name_placeholder': 'Dizüstüler, Mobilya, Kameralar…',
-  'inventory.category_order': 'Sıra',
-  'inventory.category_order_hint': 'Küçük sayı önce gelir. Sırası aynı olan kategoriler ada göre sıralanır.',
-  'inventory.category_order_invalid': '0 ile 9999 arasında bir tam sayı girin',
+  'inventory.category_reorder_hint':
+    'Görünme sırasını değiştirmek için bir kategoriyi sürükleyin ya da satırındaki okları kullanın.',
+  'inventory.category_move_up': '{name} kategorisini yukarı taşı',
+  'inventory.category_move_down': '{name} kategorisini aşağı taşı',
+  'inventory.category_position_first': '{name} ilk sırada',
+  'inventory.category_position_last': '{name} son sırada',
+  'inventory.category_position_after': '{name}, {other} kategorisinden sonra',
   'inventory.category_created_toast': '{name} eklendi',
   'inventory.category_updated_toast': '{name} kaydedildi',
   'inventory.category_archived_toast': '{name} arşivlendi',
@@ -1397,6 +1456,10 @@ export const tr: Record<string, Message> = {
   'inventory.error_repair_returned_before_sent':
     'Bir onarım gönderilmeden önce dönemez. İki tarihi kontrol edin.',
   'inventory.error_category_name_taken': 'Bu çalışma alanında bu adda bir kategori zaten var.',
+  'inventory.error_category_order_stale':
+    'Bu sayfa açıkken başkası kategorileri değiştirdi, bu yüzden bu sıralama kaydedilmedi. Aşağıdaki liste yenilendi — sırayı yeniden verin.',
+  'inventory.error_category_limit_reached':
+    'Bir çalışma alanı aynı anda {max} kategori tutabilir ve bu alanda hepsi dolu. Yer açmak için artık kullanılmayan bir kategoriyi arşivleyin.',
   'inventory.error_not_found':
     'O artık orada değil. Biri kaldırmış ya da arşivlemiş olabilir — sayfayı yeniden yükleyin.',
   'inventory.error_forbidden': 'Bunu yapma yetkiniz yok.',

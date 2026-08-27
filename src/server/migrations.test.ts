@@ -53,14 +53,17 @@ function migrationFiles(): string[] {
  * folder may use a dollar-quoted body: a breakpoint inside `do $$ … end $$` cuts the function in
  * half, and the error is `unterminated dollar-quoted string`, which does not sound like what it is.
  */
-async function apply(file: string): Promise<Array<{ statement: string; error: string }>> {
+async function apply(
+  file: string,
+  client: pg.Client = db,
+): Promise<Array<{ statement: string; error: string }>> {
   const sql = readFileSync(join(MIGRATIONS, file), 'utf8')
   const failures: Array<{ statement: string; error: string }> = []
   for (const raw of sql.split('--> statement-breakpoint')) {
     const statement = raw.trim()
     if (!statement || statement.split('\n').every((l) => l.trim().startsWith('--'))) continue
     try {
-      await db.query(statement)
+      await client.query(statement)
     } catch (err) {
       failures.push({
         statement: statement.slice(0, 120).replace(/\s+/g, ' '),
@@ -237,6 +240,26 @@ describe('the migration folder', () => {
     expect(new Set(rows.map((r) => r.seq)).size, 'three distinct sequence values').toBe(3)
   })
 
+  /**
+   * The index that makes "no two live categories share a place" a fact rather than an intention.
+   *
+   * Partial on purpose, and the `WHERE` is the half worth asserting: an archived category keeps the
+   * number it had when it left, and the next reorder renumbers a live row straight onto it. A total
+   * unique index would refuse that entirely correct pair, during a migration, which is a host service
+   * that does not boot rather than a settings screen that misbehaves.
+   */
+  it('keeps the partial index that makes two live categories on one place impossible', async () => {
+    const { rows } = await db.query<{ indexdef: string }>(
+      `select indexdef from pg_indexes
+        where schemaname = 'mod_inventory' and indexname = 'inventory_categories_ws_order_live_uq'`,
+    )
+    // Exactly one after the replay: the `if not exists` is added by hand in `0008`.
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.indexdef).toContain('UNIQUE')
+    expect(rows[0]?.indexdef).toMatch(/workspace_id.*order/s)
+    expect(rows[0]?.indexdef, 'live rows only').toContain('WHERE (archived_at IS NULL)')
+  })
+
   it('keeps the partial index that makes two open repairs impossible', async () => {
     // drizzle emits a bare `CREATE UNIQUE INDEX` for this one; the `if not exists` is added by
     // hand in `0003_repairs.sql`, and a replay is the only thing that proves it is really there.
@@ -247,5 +270,120 @@ describe('the migration folder', () => {
     expect(rows).toHaveLength(1)
     // Partial, not total: an asset may be repaired many times, just not twice at once.
     expect(rows[0]?.indexdef).toContain('WHERE (returned_on IS NULL)')
+  })
+})
+
+/**
+ * The upgrade that has rows the new index would refuse — which is every instance that ran 0.2.0.
+ *
+ * A fresh database can never exercise this, and a fresh database is what every test above uses: the
+ * folder is applied in order, so by the time `0008` runs nothing has had a chance to write a
+ * duplicate. That is the shape of test that passes while the release it is guarding takes production
+ * down. `CREATE UNIQUE INDEX` meeting two live rows on one number throws, a module's migrations are
+ * the first thing the kernel runs, and `core` hosts five modules and never binds its port.
+ *
+ * So this builds the database an existing instance actually has — the folder up to `0007`, with
+ * duplicates written into it the way the append race wrote them — and then applies `0008` alone.
+ */
+describe('upgrading a database that already has two live categories on one place', () => {
+  const DUPES_DB = `${DB_NAME}_dupes`
+  const WS = '00000000-0000-4000-8000-00000000d0d0'
+  const OTHER = '00000000-0000-4000-8000-00000000d0d1'
+  let dupes: pg.Client
+
+  beforeAll(async () => {
+    await admin.query(`create database "${DUPES_DB}"`)
+    const url = new URL(BASE_URL)
+    url.pathname = `/${DUPES_DB}`
+    dupes = new pg.Client({ connectionString: url.toString() })
+    await dupes.connect()
+
+    // Everything an instance on 0.2.0 has, and nothing this migration adds.
+    for (const file of migrationFiles().filter((f) => f < '0008')) {
+      expect(await apply(file, dupes), `${file}, on the pre-upgrade database`).toEqual([])
+    }
+
+    // Three live categories, two of them on place 1 — exactly what two appends at the same instant
+    // used to leave behind — plus an archived row sitting on a number a live row also holds, which
+    // the repair must not touch and the index must not refuse.
+    await dupes.query(
+      `insert into mod_inventory.categories (workspace_id, name, "order", archived_at) values
+         ($1,'Desks',0,null), ($1,'Chairs',1,null), ($1,'Lamps',1,null),
+         ($1,'Retired',0,now()),
+         ($2,'Untouched',7,null)`,
+      [WS, OTHER],
+    )
+  }, 120_000)
+
+  afterAll(async () => {
+    await dupes?.end().catch(() => undefined)
+    await admin?.query(`drop database if exists "${DUPES_DB}" with (force)`).catch(() => undefined)
+  })
+
+  it('renumbers the duplicates instead of failing the boot', async () => {
+    expect(await apply('0008_category_order_unique.sql', dupes), 'the upgrade itself').toEqual([])
+
+    const { rows } = await dupes.query<{ name: string; order: number }>(
+      `select name, "order" from mod_inventory.categories
+        where workspace_id = $1 and archived_at is null order by "order"`,
+      [WS],
+    )
+    expect(
+      rows.map((r) => [r.name, r.order]),
+      'walked in the order the screen already showed them — ("order", "name") — so nothing visibly moved',
+    ).toEqual([
+      ['Desks', 0],
+      ['Chairs', 1],
+      ['Lamps', 2],
+    ])
+  })
+
+  it('leaves a workspace that had no duplicate exactly as it was', async () => {
+    const { rows } = await dupes.query<{ order: number }>(
+      `select "order" from mod_inventory.categories where workspace_id = $1`,
+      [OTHER],
+    )
+    expect(
+      rows.map((r) => r.order),
+      'a sparse but valid sequence is not a defect to tidy up',
+    ).toEqual([7])
+  })
+
+  it('leaves the archived row on the number a live row now holds', async () => {
+    const { rows } = await dupes.query<{ order: number }>(
+      `select "order" from mod_inventory.categories
+        where workspace_id = $1 and archived_at is not null`,
+      [WS],
+    )
+    expect(
+      rows.map((r) => r.order),
+      'outside the partial index, so outside the repair',
+    ).toEqual([0])
+  })
+
+  it('applies a second time, because a replay must not take down the host service', async () => {
+    expect(await apply('0008_category_order_unique.sql', dupes), 'replayed').toEqual([])
+    const { rows } = await dupes.query<{ name: string; order: number }>(
+      `select name, "order" from mod_inventory.categories
+        where workspace_id = $1 and archived_at is null order by "order"`,
+      [WS],
+    )
+    expect(
+      rows.map((r) => [r.name, r.order]),
+      'and it changed nothing the second time',
+    ).toEqual([
+      ['Desks', 0],
+      ['Chairs', 1],
+      ['Lamps', 2],
+    ])
+  })
+
+  it('refuses a duplicate from then on', async () => {
+    await expect(
+      dupes.query(
+        `update mod_inventory.categories set "order" = 0 where workspace_id = $1 and name = 'Chairs'`,
+        [WS],
+      ),
+    ).rejects.toThrow(/inventory_categories_ws_order_live_uq/)
   })
 })

@@ -111,6 +111,17 @@ export const categories = schema.table(
     // two rows a picker cannot tell apart the moment somebody restores the second.
     uniqueIndex('inventory_categories_ws_name_uq').on(t.workspaceId, t.name),
     index('inventory_categories_ws_idx').on(t.workspaceId, t.order),
+    /**
+     * One live category per place, which the contract claims and nothing enforced until `0008`.
+     *
+     * **Partial, over the live rows only.** An archived category keeps the number it had when it was
+     * archived and the next reorder renumbers a live row onto it — a collision nobody can see, since
+     * an archived category is in no picker, no filter and no sequence. A total unique index would
+     * refuse that entirely correct pair.
+     */
+    uniqueIndex('inventory_categories_ws_order_live_uq')
+      .on(t.workspaceId, t.order)
+      .where(sql`${t.archivedAt} is null`),
   ],
 )
 

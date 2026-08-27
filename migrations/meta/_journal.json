@@ -57,6 +57,13 @@
       "when": 1787788455674,
       "tag": "0007_history_sequence",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1787788455675,
+      "tag": "0008_category_order_unique",
+      "breakpoints": true
     }
   ]
 }

@@ -235,7 +235,7 @@ describe('mock categories', () => {
 
   it('creates, renames and archives without ever deleting', async () => {
     const api = createMockInventoryApi()
-    const made = await api.categories.create({ workspaceId: WS, name: 'Tools', order: 9 })
+    const made = await api.categories.create({ workspaceId: WS, name: 'Tools' })
     expect(made.name).toBe('Tools')
     const renamed = await api.categories.update({ workspaceId: WS, categoryId: made.id, name: 'Hand tools' })
     expect(renamed.name).toBe('Hand tools')
@@ -244,6 +244,76 @@ describe('mock categories', () => {
     // Still there, which is the point — restoring is the same procedure.
     await api.categories.archive({ workspaceId: WS, categoryId: made.id, archived: false })
     expect((await api.categories.list({ workspaceId: WS })).map((c) => c.id)).toContain(made.id)
+  })
+
+  /**
+   * A new category joins the **end**, and so does a restored one.
+   *
+   * The demo has to agree with the server about this or the settings page contradicts itself in
+   * exactly the environment the product is shown in: a category added while somebody watches
+   * appearing in the middle of a list they just arranged is the defect the *Position* field caused.
+   */
+  it('appends a new category, and a restored one, rather than dropping it into the middle', async () => {
+    const api = createMockInventoryApi()
+    const made = await api.categories.create({ workspaceId: WS, name: 'Tools' })
+    expect((await api.categories.list({ workspaceId: WS })).map((c) => c.name)).toEqual([
+      'Laptops',
+      'Displays',
+      'Furniture',
+      'Cameras',
+      'Tools',
+    ])
+
+    const all = await api.categories.list({ workspaceId: WS, archived: true })
+    const phones = all.find((c) => c.name === 'Phones')
+    await api.categories.archive({ workspaceId: WS, categoryId: phones?.id ?? '', archived: false })
+    const live = await api.categories.list({ workspaceId: WS })
+    expect(live.at(-1)?.name, 'restored at the end, not back on its old number').toBe('Phones')
+    expect(new Set(live.map((c) => c.order)).size, 'and no two live categories share a place').toBe(
+      live.length,
+    )
+    expect(made.name).toBe('Tools')
+  })
+
+  /**
+   * Reordering, including both refusals — a demo that can only show the happy path cannot exercise
+   * the settings page's rollback, which is the half of the feature nobody sees until it matters.
+   */
+  it('reorders the sequence, and refuses a list that no longer describes the workspace', async () => {
+    const api = createMockInventoryApi()
+    const live = await api.categories.list({ workspaceId: WS })
+    const ids = live.map((c) => c.id)
+
+    const moved = await api.categories.reorder({
+      workspaceId: WS,
+      categoryIds: [ids[3] as string, ...ids.slice(0, 3)],
+    })
+    expect(moved.map((c) => c.name)).toEqual(['Cameras', 'Laptops', 'Displays', 'Furniture'])
+    expect((await api.categories.list({ workspaceId: WS })).map((c) => c.name)).toEqual([
+      'Cameras',
+      'Laptops',
+      'Displays',
+      'Furniture',
+    ])
+
+    await expect(
+      api.categories.reorder({ workspaceId: WS, categoryIds: ids.slice(0, 2) }),
+    ).rejects.toMatchObject({ code: 'CONFLICT', data: { reason: 'inventory.category.order_stale' } })
+
+    await expect(
+      api.categories.reorder({
+        workspaceId: WS,
+        categoryIds: [...ids, '01920000-0000-7000-8000-0000000000ff'],
+      }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' })
+
+    // Neither refusal wrote anything.
+    expect((await api.categories.list({ workspaceId: WS })).map((c) => c.name)).toEqual([
+      'Cameras',
+      'Laptops',
+      'Displays',
+      'Furniture',
+    ])
   })
 })
 
