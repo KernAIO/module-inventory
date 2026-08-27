@@ -21,6 +21,13 @@ const key = (suffix: string) => {
 export const INVENTORY_PERMISSIONS = {
   view: key('asset.view'),
   manage: key('asset.manage'),
+  /** Handing an item over and taking it back. Reading who holds what rides `view` — see the
+   *  contract's `permissions.ts` for why that is a decision rather than an omission. */
+  custody: key('custody.manage'),
+  /** Sending an item away, correcting the record and logging it back. */
+  repairs: key('repair.manage'),
+  /** The categories settings page, and nothing else. */
+  categories: key('category.manage'),
 } as const
 
 export type InventoryPermission = keyof typeof INVENTORY_PERMISSIONS

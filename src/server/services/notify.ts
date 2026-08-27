@@ -51,6 +51,23 @@ export class NotifyService {
   }
 
   /**
+   * `best`, asked the other question: **did the call actually happen**, rather than what it returned.
+   *
+   * `best` cannot answer that — a procedure that legitimately answers `null` or `undefined` is
+   * indistinguishable from one that threw and was swallowed, and a caller writing "I have told
+   * them" into a database on the strength of that is writing a lie. So the value is thrown away
+   * here and the boolean is the whole answer.
+   */
+  private async attempted(what: string, fn: () => Promise<unknown>): Promise<boolean> {
+    return (
+      (await this.best(what, async () => {
+        await fn()
+        return true as const
+      })) === true
+    )
+  }
+
+  /**
    * Append to the asset's own history, inside the caller's transaction.
    *
    * This row is the authoritative record and belongs in the transaction it describes — if the write
@@ -87,13 +104,34 @@ export class NotifyService {
     )
   }
 
-  async notify(input: NotifyInput): Promise<void> {
+  /**
+   * Tell these people, and answer **who it was meant for and how many of them were actually
+   * written** — both numbers, because one of them cannot be checked without the other.
+   *
+   * Everything this class does is best-effort, so a failed `core.notifications.create` is swallowed
+   * and logged; a caller that then records "this one has been notified" has recorded something that
+   * never happened. The two nightly sweeps write exactly such a marker, once per row for ever, so a
+   * swallowed failure there is not a delayed notice but a notice nobody will ever receive.
+   *
+   * This used to answer a single count, and the sweeps marked the row whenever it was above zero —
+   * so a notice that reached one of three recipients was stamped *told*, and the two who missed it
+   * never heard. **A partial delivery is a failure for the people it did not reach**, and the row
+   * cannot record two answers, so the honest one is the pessimistic one: the sweeps mark nothing
+   * unless `delivered === targeted`, and say it again in the morning. The cost is that whoever did
+   * hear it hears it twice; `groupKey` collapses that in the notification centre, and it is a
+   * strictly smaller price than one person never being told at all.
+   *
+   * `targeted` is what is left after the de-duplication and the exclusions, which is why the caller
+   * cannot work it out from the list it passed in. `targeted: 0` means there was nobody to tell,
+   * which is also not "told".
+   */
+  async notify(input: NotifyInput): Promise<{ targeted: number; delivered: number }> {
     const excluded = new Set([...(input.exclude ?? [])].filter(Boolean) as string[])
     const targets = [...new Set(input.userIds)].filter((id) => id && !excluded.has(id))
-    if (!targets.length) return
-    await Promise.all(
+    if (!targets.length) return { targeted: 0, delivered: 0 }
+    const written = await Promise.all(
       targets.map((userId) =>
-        this.best('notifications.create', () =>
+        this.attempted('notifications.create', () =>
           this.kernel.call('core.notifications.create', {
             userId,
             workspaceId: input.workspaceId,
@@ -110,6 +148,7 @@ export class NotifyService {
         ),
       ),
     )
+    return { targeted: targets.length, delivered: written.filter(Boolean).length }
   }
 
   /** Realtime cache invalidation for connected clients. */
@@ -132,9 +171,15 @@ export class NotifyService {
     )
   }
 
-  // Nothing calls `index`/`unindex` yet: `objectTypes` came off the module definition until there
-  // is a resolver and an indexer to stand behind it. They are kept as they are, copied from
-  // tracker, and are wired up by the change that declares the object type again.
+  /**
+   * The workspace-wide search index, written to by `SearchService` and by nothing else.
+   *
+   * These two spent a release with no caller: `objectTypes` had been taken off the module
+   * definition, because a declared type with no indexer and no resolver renders a link to nothing.
+   * Both halves exist now — `src/server/services/search.ts` builds the documents, `src/server/
+   * index.ts` declares the indexer and the resolver — and every asset mutation reindexes after it
+   * has committed.
+   */
   async index(documents: core.SearchDocument[]): Promise<void> {
     if (!documents.length) return
     await this.best('search.index', () => this.kernel.call('core.search.index', { documents }))

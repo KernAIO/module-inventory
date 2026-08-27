@@ -15,6 +15,12 @@
  * the list and the dashboard card behind it stayed stale until a reload. Every other module keys
  * the list and the row off one singular entity name (`['tracker', 'issue', …]`); so does this one
  * now.
+ *
+ * **The timeline and the custody list hang off the asset's own key**, one segment deeper. That is
+ * what lets custody announce itself as `entity: 'asset'` and refresh all four things it changed —
+ * the row, the list, the detail panel and both of its tabs — from one change event, because
+ * `partialMatchKey` matches on the prefix. A separate `['inventory', 'custody', …]` would need the
+ * server to emit a second entity for the same write.
  */
 export const inventoryKeys = {
   /** Everything under this module, for the blunt invalidation after a write. */
@@ -22,4 +28,34 @@ export const inventoryKeys = {
   assets: (ws: string, filters?: Record<string, unknown>) =>
     filters ? (['inventory', 'asset', ws, filters] as const) : (['inventory', 'asset', ws] as const),
   asset: (ws: string, id: string) => ['inventory', 'asset', ws, id] as const,
+  /** The asset's own timeline. Under the asset, so one `asset` change refreshes it. */
+  assetHistory: (ws: string, id: string) => ['inventory', 'asset', ws, id, 'history'] as const,
+  /** Every custody period for one asset. Under the asset, for the same reason. */
+  assetCustody: (ws: string, id: string) => ['inventory', 'asset', ws, id, 'custody'] as const,
+  /** One asset's repairs. Under the asset, so a repair announced as an `asset` change refreshes it. */
+  assetRepairs: (ws: string, id: string) => ['inventory', 'asset', ws, id, 'repairs'] as const,
+  /** One asset's files, its repairs' included — the panel groups them, so there is one key. */
+  assetAttachments: (ws: string, id: string) => ['inventory', 'asset', ws, id, 'attachments'] as const,
+  /**
+   * The workspace's repairs, which belong to no single asset — the "what is away right now" card.
+   *
+   * Its own entity, because it cannot hang under one asset's key: `src/server/router.ts` therefore
+   * announces a repair twice, once as the asset that changed and once as the repair itself.
+   */
+  repairs: (ws: string, filters?: Record<string, unknown>) =>
+    filters ? (['inventory', 'repair', ws, filters] as const) : (['inventory', 'repair', ws] as const),
+  /**
+   * The register in numbers.
+   *
+   * Under the **asset** prefix on purpose, one segment deep: every number it holds is a count of
+   * assets, so every write that changes one of those counts already announces `entity: 'asset'` and
+   * this is refreshed by the same event. `'stats'` cannot collide with `asset(ws, id)` — that
+   * segment is always a uuid.
+   */
+  stats: (ws: string) => ['inventory', 'asset', ws, 'stats'] as const,
+  /**
+   * The workspace's categories. Its own entity because it has its own change event: a rename
+   * touches every asset row on screen, and `src/server/router.ts` therefore emits both.
+   */
+  categories: (ws: string, archived = false) => ['inventory', 'category', ws, { archived }] as const,
 }

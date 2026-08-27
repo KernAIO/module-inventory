@@ -1,14 +1,17 @@
 <script lang="ts">
 import {
   Badge,
-  type BadgeTone,
   Button,
+  coreApi,
   Dialog,
   DropdownMenu,
   EmptyState,
+  formatDate,
   IconButton,
   Input,
+  keys,
   type MenuItem,
+  navigation,
   Page,
   PageHeader,
   Select,
@@ -22,13 +25,20 @@ import {
   TableRow,
   toast,
 } from '@kernhq/ui'
-import { createInfiniteQuery, createMutation, useQueryClient } from '@tanstack/svelte-query'
-import type { Asset, AssetStatus } from '../../contract/index.js'
+import { createInfiniteQuery, createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query'
+import type { Asset, AssetStatus, Category } from '../../contract/index.js'
 import { getInventoryApi } from '../api-instance.js'
+import { isolated } from '../bidi.js'
+import AssetDetailPanel from '../components/AssetDetailPanel.svelte'
 import AssetFormDialog from '../components/AssetFormDialog.svelte'
+import type { CoreApi, CoreMember } from '../core-api.js'
+import { errorMessage } from '../errors.js'
 import { t } from '../i18n.js'
+import { ASSET_PARAM } from '../links.js'
+import { directory, directoryStatus, nameOf } from '../members.js'
 import { canInventory } from '../permissions.js'
 import { inventoryKeys } from '../query.js'
+import { statusTone } from '../status.js'
 
 /**
  * This module's screen.
@@ -46,10 +56,12 @@ interface Props {
 const { workspaceId }: Props = $props()
 
 const api = getInventoryApi()
+const core = coreApi<CoreApi>()
 const queryClient = useQueryClient()
 
 let searchText = $state('')
 let statusFilter = $state<string>('')
+let categoryFilter = $state<string>('')
 let showArchived = $state(false)
 let dialogOpen = $state(false)
 /** The row the dialog is editing, or null when it is adding one. */
@@ -66,6 +78,18 @@ $effect(() => {
 })
 
 /**
+ * The two filters that live in the URL rather than in this component.
+ *
+ * `?asset=<id>` is which panel is open, and `?custodian=<userId>` is "what is this person holding"
+ * — the return list an offboarding notification links to. Both are in the URL for the same reason:
+ * they are places somebody went, so they survive a reload, can be shared with the person who has to
+ * act on them, and close on Back. Built from `navigation` because a module cannot read `$app/state`
+ * — it is a SvelteKit alias, and this package is type-checked on its own.
+ */
+const params = $derived(new URLSearchParams(navigation.search))
+const custodianFilter = $derived(params.get('custodian') ?? '')
+
+/**
  * Every filter is part of the key and part of the request.
  *
  * Filtering in the browser is only ever right for a list that is entirely loaded, and this one is
@@ -75,6 +99,8 @@ $effect(() => {
 const filters = $derived({
   ...(query ? { q: query } : {}),
   ...(statusFilter ? { status: statusFilter as AssetStatus } : {}),
+  ...(categoryFilter ? { categoryId: categoryFilter } : {}),
+  ...(custodianFilter ? { custodianUserId: custodianFilter } : {}),
   archived: showArchived,
 })
 
@@ -83,15 +109,56 @@ const filters = $derived({
  *
  * The archived switch is not in here: it widens the list rather than narrowing it, so a workspace
  * with no assets and the switch on is still empty rather than filtered, and offering to "clear" it
- * would hide rows somebody just asked to see.
+ * would hide rows somebody just asked to see. The custodian **is** in here, so the count line stops
+ * claiming the workspace total the moment the list is one person's.
  */
-const narrowed = $derived(Boolean(query) || Boolean(statusFilter))
+const narrowed = $derived(
+  Boolean(query) || Boolean(statusFilter) || Boolean(categoryFilter) || Boolean(custodianFilter),
+)
 
 function clearFilters() {
   searchText = ''
   query = ''
   statusFilter = ''
+  categoryFilter = ''
+  setParam('custodian', null)
 }
+
+/**
+ * The people this workspace has, asked for only when there is a uuid on screen to turn into a name.
+ *
+ * The same key `AssetDetailPanel` uses, so opening a panel afterwards costs no second request — and
+ * no request at all in the ordinary case, where nothing is filtered by custodian.
+ */
+const membersQuery = createQuery(() => ({
+  queryKey: keys.members(workspaceId),
+  queryFn: () => core.workspaces.members.list({ workspaceId }),
+  enabled: Boolean(workspaceId) && Boolean(custodianFilter),
+}))
+const dir = $derived(
+  directory((membersQuery.data?.items ?? []) as CoreMember[], directoryStatus(membersQuery)),
+)
+/**
+ * Whose list this is.
+ *
+ * `nameOf` never answers with the uuid: somebody who has since been removed from the workspace
+ * reads as "a former member", which is exactly the case this filter exists for — the offboarding
+ * notification is *about* somebody who has left.
+ *
+ * It only says so once the member list has actually arrived. Before that this line claimed the
+ * person had left the workspace while their name was still being fetched, on the one screen whose
+ * whole purpose is to be *about* a named person.
+ */
+const custodianName = $derived(
+  custodianFilter
+    ? nameOf(custodianFilter, dir, {
+        loading: t('member_loading'),
+        unknown: t('member_unknown'),
+        former: t('member_former'),
+        system: t('member_system'),
+      })
+    : null,
+)
 
 interface AssetPage {
   items: Asset[]
@@ -116,29 +183,118 @@ const assetsQuery = createInfiniteQuery(() => ({
 const assets = $derived(assetsQuery.data?.pages.flatMap((page) => page.items) ?? [])
 
 /**
+ * The workspace's categories, **archived ones included**.
+ *
+ * One query rather than two, and it asks for everything because the two things it feeds want
+ * different halves: the chip on a row has to name the category an asset carries even after somebody
+ * archived it — that is the whole point of archiving rather than deleting — while the filter offers
+ * only the live ones, because filtering by something nobody can file anything under is a dead end.
+ *
+ * The key is the same one `AssetDetailPanel` uses, so opening a panel costs no second request.
+ */
+const categoriesQuery = createQuery(() => ({
+  queryKey: inventoryKeys.categories(workspaceId, true),
+  queryFn: () => api.categories.list({ workspaceId, archived: true }),
+  enabled: Boolean(workspaceId),
+}))
+const categories = $derived<Category[]>(categoriesQuery.data ?? [])
+const categoryNames = $derived(new Map(categories.map((row) => [row.id, row.name])))
+
+/**
+ * What the filter offers: the live categories, plus whichever one is currently chosen.
+ *
+ * The second half matters exactly once, and it is not hypothetical — somebody filters by "Cameras",
+ * an administrator archives it in another tab, and without this the control would show an empty
+ * value while the list stayed filtered. A filter that does not say what it is filtering by is worse
+ * than one offering a category nobody can file anything new under.
+ */
+const categoryOptions = $derived<SelectOption[]>([
+  { value: '', label: t('filter_all_categories') },
+  ...categories
+    .filter((row) => !row.archivedAt || row.id === categoryFilter)
+    .map((row) => ({ value: row.id, label: row.name })),
+])
+
+// ------------------------------------------------------------------- the panel, and the URL
+
+/**
+ * Which asset is open lives in the URL, not in this component's state. See `params` above.
+ *
+ * The parameter's name comes from `links.ts`, which is also where a dashboard card builds the link
+ * that sets it — one constant, so a card cannot send somebody to a URL this page ignores.
+ */
+const openAssetId = $derived(params.get(ASSET_PARAM))
+
+/**
+ * Set or clear one search parameter, leaving every other one alone.
+ *
+ * One function rather than one per parameter, because "keep the rest of the URL" is the part that
+ * is easy to get wrong: clearing the custodian filter by rebuilding the query string from scratch
+ * would close the panel somebody has open.
+ *
+ * A push, deliberately — not the `replaceState` a filter change would use. Opening a panel, and
+ * arriving on somebody's return list from a notification, are both places somebody went, so Back
+ * should undo them; a keystroke in the search box is not, and a list that pushed every one of those
+ * would fill the back button with states nobody meant to visit.
+ */
+function setParam(name: string, value: string | null) {
+  const next = new URLSearchParams(navigation.search)
+  if (value) next.set(name, value)
+  else next.delete(name)
+  const search = next.toString()
+  void navigation.go(`${navigation.pathname}${search ? `?${search}` : ''}`, {
+    keepFocus: true,
+    noScroll: true,
+  })
+}
+
+const setAsset = (id: string | null) => setParam(ASSET_PARAM, id)
+
+/**
+ * The register in numbers, for the one line that has to be a number.
+ *
+ * One request for the whole workspace rather than a `count(*)` bolted onto every page of a keyset
+ * list — which is the expensive way to answer a question that does not change between pages.
+ */
+const statsQuery = createQuery(() => ({
+  queryKey: inventoryKeys.stats(workspaceId),
+  queryFn: () => api.stats.summary({ workspaceId }),
+  enabled: Boolean(workspaceId),
+}))
+
+/**
  * A count that stays true while the list pages.
  *
  * `t('count', { n: assets.length })` counted the pages *loaded*, so 120 assets read "50 assets" and
  * then "100 assets" after Load more — a number that is simply wrong, on the line whose whole job is
- * to be the number. When the server fills `total` that is the honest figure; until it does, a list
- * with another page says how many it is *showing* rather than claiming that is all there is.
+ * to be the number.
+ *
+ * Three answers, in order of how true they are. **The workspace total** when nothing is narrowing
+ * the list and archived rows are out, because then the list *is* every live asset and
+ * `stats.summary` has counted them. **What the server said** if it ever fills `total` on a page.
+ * Otherwise how many are being *shown*, which is honest about being a partial answer rather than
+ * claiming a filtered, half-loaded list is all there is.
  */
 const reportedTotal = $derived(assetsQuery.data?.pages.at(-1)?.total)
+const workspaceTotal = $derived(!narrowed && !showArchived ? statsQuery.data?.total : undefined)
 const countLine = $derived(
-  reportedTotal !== undefined
-    ? t('count', { n: reportedTotal })
-    : assetsQuery.hasNextPage
-      ? t('count_showing', { n: assets.length })
-      : t('count', { n: assets.length }),
+  workspaceTotal !== undefined
+    ? t('count', { n: workspaceTotal })
+    : reportedTotal !== undefined
+      ? t('count', { n: reportedTotal })
+      : assetsQuery.hasNextPage
+        ? t('count_showing', { n: assets.length })
+        : t('count', { n: assets.length }),
 )
 
 /**
  * Every status the contract can hold, offered ahead of the features that set them.
  *
- * Until custody and repairs ship, nothing writes a status, so every asset is `in_stock` and the
- * other five options correctly return nothing. That is the data being uniform rather than the
- * filter being broken — and the alternative, hiding options and adding them back one release
- * later, teaches somebody the list is unstable. The README says the same thing in as many words.
+ * Three of the six are written now — `in_stock` and `assigned` by custody, `under_repair` by a
+ * repair — and `reserved`, `lost` and `retired` wait on the features that set them, so those three
+ * correctly return nothing. That is the data being uniform rather than the filter being broken, and
+ * the alternative — hiding options and adding them back one release later — teaches somebody the
+ * list is unstable. The README says the same thing in as many words.
  */
 const statusOptions: SelectOption[] = [
   { value: '', label: t('filter_all_statuses') },
@@ -149,23 +305,6 @@ const statusOptions: SelectOption[] = [
   { value: 'lost', label: t('status_lost') },
   { value: 'retired', label: t('status_retired') },
 ]
-
-function statusTone(status: string): BadgeTone {
-  switch (status) {
-    case 'assigned':
-      return 'info'
-    case 'reserved':
-      return 'info'
-    case 'under_repair':
-      return 'warning'
-    case 'lost':
-      return 'danger'
-    case 'retired':
-      return 'grey'
-    default:
-      return 'success'
-  }
-}
 
 // ---------------------------------------------------------------- row actions
 
@@ -189,11 +328,15 @@ const setArchived = createMutation(() => ({
   mutationFn: (vars: ArchiveVars) =>
     api.assets.archive({ workspaceId, assetId: vars.assetId, archived: vars.archived }),
   onSuccess: (_saved: Asset, vars: ArchiveVars) => {
-    toast.success(t(vars.archived ? 'archived_toast' : 'restored_toast', { name: vars.name }))
+    toast.success(t(vars.archived ? 'archived_toast' : 'restored_toast', isolated({ name: vars.name })))
     void queryClient.invalidateQueries({ queryKey: inventoryKeys.all })
     archiving = null
   },
-  onError: (error: Error) => toast.error(error.message || t('common.error')),
+  // Not `error.message`: that is a sentence the *server* wrote, in English, and archiving something
+  // somebody is still holding is exactly the refusal a reader needs to understand. `errors.ts` maps
+  // the reason token this module's server sends — `inventory.asset.still_held` — to a translated
+  // sentence, and keeps the server's words only for a failure it does not recognise.
+  onError: (error: unknown) => toast.error(errorMessage(error, t)),
   onSettled: () => {
     acting = false
   },
@@ -234,7 +377,12 @@ function openEdit(asset: Asset) {
  * not there at all rather than being a door that will not open.
  */
 function actionsFor(asset: Asset): MenuItem[] {
-  const items: MenuItem[] = [{ label: t('common.edit'), icon: 'square-pen', onSelect: () => openEdit(asset) }]
+  const items: MenuItem[] = [
+    // The name in the row is already a button that opens this; the menu carries it too because a
+    // menu that lists everything a row can do is the one place somebody looks for what a row can do.
+    { label: t('open'), icon: 'arrow-right', onSelect: () => setAsset(asset.id) },
+    { label: t('common.edit'), icon: 'square-pen', onSelect: () => openEdit(asset) },
+  ]
   if (asset.archivedAt) {
     items.push({ label: t('restore'), icon: 'rotate-ccw', onSelect: () => restore(asset) })
   } else {
@@ -271,6 +419,12 @@ const SKELETON_ROWS = [0, 1, 2, 3, 4, 5]
     />
   {/snippet}
   {#snippet actions()}
+    <Select
+      bind:value={categoryFilter}
+      options={categoryOptions}
+      size="sm"
+      ariaLabel={t('category')}
+    />
     <Select bind:value={statusFilter} options={statusOptions} size="sm" ariaLabel={t('status')} />
     {#if canManage}
       <Button size="sm" icon="plus" onclick={openCreate}>{t('new')}</Button>
@@ -279,6 +433,21 @@ const SKELETON_ROWS = [0, 1, 2, 3, 4, 5]
 </PageHeader>
 
 <Page>
+  <!--
+    The return list, when somebody arrived here from an offboarding notification.
+    Named rather than silent: a list that has quietly dropped nine tenths of the register with no
+    sentence saying why is the single most confusing thing a filter can do, and this one is not set
+    by any control on the page — it came in on the URL.
+  -->
+  {#if custodianFilter}
+    <div class="held-by">
+      <span>{t('held_by', isolated({ name: custodianName ?? '' }))}</span>
+      <Button size="sm" variant="ghost" onclick={() => setParam('custodian', null)}>
+        {t('held_by_clear')}
+      </Button>
+    </div>
+  {/if}
+
   <div class="bar">
     <p class="count" aria-live="polite">{countLine}</p>
     <Switch bind:checked={showArchived} size="sm" label={t('show_archived')} />
@@ -339,19 +508,50 @@ const SKELETON_ROWS = [0, 1, 2, 3, 4, 5]
           <TableCell><code>{asset.code}</code></TableCell>
           <TableCell>
             <span class="stack">
-              <span class="name">{asset.name}</span>
-              <!-- `S/N` was a literal English abbreviation sitting in the middle of a Persian,
-                   Arabic, German or Turkish table; `serial_number` is translated in all five. -->
-              {#if asset.serialNumber}
+              <!--
+                A button rather than the whole row: a row carrying a menu cannot itself be a button
+                without nesting one inside the other, which is invalid and breaks the menu. The name
+                is what somebody aims at anyway, and it is reachable from the keyboard.
+              -->
+              <button
+                type="button"
+                class="name"
+                onclick={() => setAsset(asset.id)}
+                aria-label={t('open_asset', isolated({ name: asset.name }))}
+              >
+                {asset.name}
+              </button>
+              {#if asset.categoryId || asset.serialNumber}
                 <span class="sub">
-                  {t('serial_number')}:
-                  <span class="ltr">{asset.serialNumber}</span>
+                  {#if asset.categoryId}
+                    <!-- Named even when the category has since been archived: `categories` is
+                         fetched with archived rows for exactly this. -->
+                    <span class="chip">
+                      {categoryNames.get(asset.categoryId) ?? t('category_none')}
+                    </span>
+                  {/if}
+                  <!-- `S/N` was a literal English abbreviation sitting in the middle of a Persian,
+                       Arabic, German or Turkish table; `serial_number` is translated in all five. -->
+                  {#if asset.serialNumber}
+                    <span class="serial">
+                      {t('serial_number')}:
+                      <span class="ltr">{asset.serialNumber}</span>
+                    </span>
+                  {/if}
                 </span>
               {/if}
             </span>
           </TableCell>
           <TableCell><span class="muted">{asset.location ?? '—'}</span></TableCell>
-          <TableCell><span class="muted">{asset.warrantyUntil ?? '—'}</span></TableCell>
+          <!-- `formatDate`, not the stored value. This column printed the ISO string — 2027-03-14
+               — beside a panel that renders the same field as "14 Mar 2027", so the same fact read
+               two ways on one screen, and a Persian reader got Gregorian Latin digits in a table
+               where every other date follows their calendar. -->
+          <TableCell>
+            <span class="muted">
+              {asset.warrantyUntil ? formatDate(asset.warrantyUntil) : '—'}
+            </span>
+          </TableCell>
           <TableCell>
             {#if asset.archivedAt}
               <Badge tone="grey">{t('archived')}</Badge>
@@ -367,7 +567,7 @@ const SKELETON_ROWS = [0, 1, 2, 3, 4, 5]
                     {...props}
                     icon="ellipsis"
                     size={28}
-                    label={t('row_actions', { name: asset.name })}
+                    label={t('row_actions', isolated({ name: asset.name }))}
                   />
                 {/snippet}
               </DropdownMenu>
@@ -394,11 +594,23 @@ const SKELETON_ROWS = [0, 1, 2, 3, 4, 5]
 
 <AssetFormDialog bind:open={dialogOpen} {workspaceId} asset={editingAsset} />
 
+<!--
+  The panel sits over the list rather than replacing it: the scroll position, the filters and the
+  page cursor are all still there when it closes. Editing is the list's own dialog, so the panel
+  asks for it rather than growing a second copy of the form.
+-->
+<AssetDetailPanel
+  {workspaceId}
+  assetId={openAssetId}
+  onclose={() => setAsset(null)}
+  onedit={(asset) => openEdit(asset)}
+/>
+
 <!-- Archiving states what happens and to what, rather than asking "Are you sure?". -->
 <Dialog
   open={archiving !== null}
   size="sm"
-  title={t('archive_title', { name: archiving?.name ?? '' })}
+  title={t('archive_title', isolated({ name: archiving?.name ?? '' }))}
   onOpenChange={(next) => {
     if (!next) archiving = null
   }}
@@ -423,6 +635,24 @@ const SKELETON_ROWS = [0, 1, 2, 3, 4, 5]
     font-size: 12px;
     color: var(--kern-ink-280);
   }
+  .held-by {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+    /* Logical, never left/right: the extra room is beside the text, which in Persian is the other
+       side of the box. */
+    padding-block: 8px;
+    padding-inline: 12px 8px;
+    border-radius: var(--kern-r-md);
+    background: var(--kern-surface-chip);
+    font-size: 13px;
+    /* A colour rather than opacity, and 600 rather than 500: this sentence is the reason the list
+       below it is short, so it is read rather than skimmed. */
+    color: var(--kern-ink-600);
+  }
   .muted {
     color: var(--kern-ink-280);
   }
@@ -446,16 +676,58 @@ const SKELETON_ROWS = [0, 1, 2, 3, 4, 5]
     min-width: 0;
   }
   .name {
+    /* A button that reads as the row's title: no chrome, the row's own type, and the pointer the
+       design system already puts on every `button`. */
+    appearance: none;
+    background: none;
+    border: 0;
+    font: inherit;
     font-weight: 500;
     color: var(--kern-ink-900);
+    text-align: start;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    /* WCAG 2.5.8 wants 24px; a line of 13px text is about 18. The padding grows the hit area and
+       the equal negative margin gives the space back, so the margin box — and therefore the row —
+       is exactly where it was. */
+    padding-block: 4px;
+    margin-block: -4px;
+    /* So the global `:focus-visible` ring is rounded like every other control. */
+    border-radius: var(--kern-r-sm);
+    /* A value somebody typed decides its own direction: `plaintext` takes it from the value's
+       first strong character, so a Latin name inside a Persian screen reads left to right and
+       keeps its own trailing punctuation instead of donating it to the paragraph. */
+    unicode-bidi: plaintext;
+  }
+  .name:hover {
+    text-decoration: underline;
+  }
+  .sub {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    font-size: 11px;
+    /* Muted with a colour, never with opacity: a faded row at 0.5 is unreadable whatever its token. */
+    color: var(--kern-ink-280);
+  }
+  .chip {
+    flex: none;
+    /* A value somebody typed decides its own direction: `plaintext` takes it from the value's
+       first strong character, so a Latin name inside a Persian screen reads left to right and
+       keeps its own trailing punctuation instead of donating it to the paragraph. */
+    unicode-bidi: plaintext;
+    padding: 1px 6px;
+    border-radius: var(--kern-r-sm);
+    background: var(--kern-surface-chip);
+    color: var(--kern-ink-600);
+    max-inline-size: 140px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .sub {
-    font-size: 11px;
-    /* Muted with a colour, never with opacity: a faded row at 0.5 is unreadable whatever its token. */
-    color: var(--kern-ink-280);
+  .serial {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

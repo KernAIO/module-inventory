@@ -11,6 +11,9 @@
  *
  * Add your module's real tests next to it; this one keeps working as the contract grows.
  */
+import { readdirSync, readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { Kernel } from '@kernhq/kernel'
 import { describe, expect, it } from 'vitest'
 import {
@@ -122,6 +125,40 @@ async function reachedFor(middleware: unknown): Promise<Reached> {
 
 const chainOf = (name: string): unknown[] => implemented[name]?.['~orpc'].middlewares ?? []
 
+/** What every implemented procedure's middleware chain reached for, resolved once. */
+async function resolveChains(): Promise<Record<string, Reached[]>> {
+  const entries = await Promise.all(
+    Object.keys(implemented).map(
+      async (name) => [name, await Promise.all(chainOf(name).map(reachedFor))] as const,
+    ),
+  )
+  return Object.fromEntries(entries)
+}
+
+/**
+ * Which of `names` the router does **not** put behind `capability`, in the right place.
+ *
+ * A pure function of the chains rather than an assertion inside a loop, so the check can be aimed at
+ * a chain this file builds by hand — which is the only way to show that it rejects what it claims
+ * to. An assertion that has never been seen to fail is a comment with a green tick beside it.
+ *
+ * Two ways to fail, and both matter: no capability gate at all, and a gate that sits *after* the
+ * permission check. The order is the whole point of `workspaceScoped` → `requiresCapability` →
+ * `requires`: a workspace with the module off must be refused before anything reveals which
+ * capabilities it would have had, and a workspace with the capability off must get 404 rather than
+ * the 403 a permission check would produce first.
+ */
+function ungated(capability: string, names: readonly string[], chains: Record<string, Reached[]>): string[] {
+  return names.filter((name) => {
+    const chain = chains[name] ?? []
+    const gate = chain.findIndex((r) => r.capability === `${MODULE_ID}.${capability}`)
+    const permission = chain.findIndex((r) => r.permission !== undefined)
+    // Index 0 is `workspaceScoped`'s place, so a gate there is a gate that displaced it.
+    if (gate < 1) return true
+    return permission !== -1 && gate > permission
+  })
+}
+
 describe('every procedure is authorised', () => {
   const declaredKeys = new Set(inventoryPermissions.map((p) => p.key))
 
@@ -168,14 +205,88 @@ describe('the module declares what it uses', () => {
  * Capabilities, which are the one thing here that cannot be seen by reading a handler.
  *
  * A missing `requiresCapability` is invisible: the procedure compiles, every other test passes, and
- * the only symptom is a workspace successfully calling a feature it switched off. So the map is
- * declared as data in the contract and checked against the router here.
+ * the only symptom is a workspace successfully calling a feature it switched off.
  *
- * The map is empty while `core` is the only capability — `core` is `required`, so nothing sits
- * behind a switch anyone can flip. These tests are what keep that true as the map fills up.
+ * **The expectation is derived from the contract, not opted into.** This used to check only the
+ * procedures named in `inventoryCapabilityProcedures` — so the map was both the claim and the
+ * evidence for it, and the regression it exists to catch walked straight past: add
+ * `repairs.cancel` to the contract, forget the middleware, forget the map, and every test here is
+ * green while a workspace with repairs switched off can call it. A list that has to be updated by
+ * the same person who forgot the thing it is guarding is not a guard.
+ *
+ * So the rule is read off the module's own declarations instead: **a switchable capability owns the
+ * router group named after it**, and every procedure in that group is gated on it. `repairs.*`
+ * belongs to `repairs`; `attachments.*` belongs to `attachments`. Adding a procedure to either group
+ * fails this file until it carries the middleware, whatever the map says. The map is still checked —
+ * it is what the client reads — but now against the group rather than against itself.
  */
 describe('capabilities are enforced where they are declared', () => {
   const gated = new Set(Object.values(inventoryCapabilityProcedures).flat())
+
+  /** The capabilities a workspace can actually switch: `core` is `required` and owns nothing. */
+  const switchable = inventoryCapabilities.filter((c) => !c.required).map((c) => c.id)
+
+  /** The contract's procedures under a capability's own name — the derived expectation. */
+  const groupOf = (capability: string) =>
+    Object.keys(declared)
+      .filter((name) => name.startsWith(`${capability}.`))
+      .sort()
+
+  it('gates every procedure in a switchable capability’s own group, named in the map or not', async () => {
+    const chains = await resolveChains()
+    for (const capability of switchable) {
+      expect(
+        groupOf(capability).length,
+        `${capability}: declared as a switch with no procedures behind it — a switch that changes nothing teaches an administrator that the switchboard does not mean anything`,
+      ).toBeGreaterThan(0)
+      expect(
+        ungated(capability, groupOf(capability), chains),
+        `these need requiresCapability('${MODULE_ID}', '${capability}') between the workspace gate and the permission check`,
+      ).toEqual([])
+    }
+  })
+
+  it('names that whole group in the map, so the client and the router cannot drift', () => {
+    // The client reads this map to decide what to hide; the router decides what to answer. A
+    // procedure gated in one and not the other is a tab that is there and 404s, or hidden and works.
+    for (const capability of switchable)
+      expect([...(inventoryCapabilityProcedures[capability] ?? [])].sort()).toEqual(groupOf(capability))
+  })
+
+  it('rejects an ungated procedure, and one gated in the wrong place', () => {
+    /**
+     * The assertion aimed at chains built here, because a check nobody has watched fail is a check
+     * nobody knows the shape of. Four procedures, one correct and three not, and `ungated` has to
+     * name exactly the three.
+     */
+    const chains: Record<string, Reached[]> = {
+      'repairs.list': [
+        { module: MODULE_ID },
+        { capability: `${MODULE_ID}.repairs` },
+        { permission: 'inventory.asset.view' },
+      ],
+      // The regression this file exists for: somebody added a procedure and no middleware.
+      'repairs.create': [{ module: MODULE_ID }, { permission: 'inventory.repair.manage' }],
+      // Gated, but after the permission — so a workspace with the capability off gets 403 from the
+      // permission check before the 404 that is the honest answer.
+      'repairs.update': [
+        { module: MODULE_ID },
+        { permission: 'inventory.repair.manage' },
+        { capability: `${MODULE_ID}.repairs` },
+      ],
+      // Gated on a different capability, which the identity check is what catches.
+      'repairs.complete': [
+        { module: MODULE_ID },
+        { capability: `${MODULE_ID}.attachments` },
+        { permission: 'inventory.repair.manage' },
+      ],
+    }
+    expect(ungated('repairs', Object.keys(chains), chains)).toEqual([
+      'repairs.create',
+      'repairs.update',
+      'repairs.complete',
+    ])
+  })
 
   it('names only capabilities the module actually declares', () => {
     const declaredIds = new Set(inventoryCapabilities.map((c) => c.id))
@@ -208,5 +319,84 @@ describe('capabilities are enforced where they are declared', () => {
   it('leaves `core` off the map, because a required capability is not a switch', () => {
     expect(inventoryCapabilityProcedures.core).toBeUndefined()
     expect(inventoryCapabilities.find((c) => c.id === 'core')?.required).toBe(true)
+  })
+})
+
+/**
+ * The manifest's other declarations — the ones that are handlers rather than middleware.
+ *
+ * Every entry here is a promise to the rest of the product, and each has exactly one shape of lie
+ * available to it: an object type with no resolver renders a link to nothing, a search indexer for a
+ * type nobody declared indexes documents nothing can open, a notification type nothing sends is a
+ * row in everybody's preferences that changes nothing, and a job with no cron never runs. All four
+ * compile. `objectTypes` was removed from this module in 0.2.0 for precisely the first of them.
+ */
+describe('the platform surfaces the module declares', () => {
+  const objectTypes = inventoryModule.definition.objectTypes ?? []
+
+  it('backs every object type with a resolver and an indexer', () => {
+    const resolved = new Set((inventoryModule.resolvers ?? []).map((r) => r.type))
+    const indexed = new Set((inventoryModule.search ?? []).flatMap((s) => s.types))
+    for (const { type } of objectTypes)
+      expect({ type, resolved: resolved.has(type), indexed: indexed.has(type) }).toEqual({
+        type,
+        resolved: true,
+        indexed: true,
+      })
+  })
+
+  it('declares every type it resolves or indexes, so nothing points at an undeclared noun', () => {
+    const declared = new Set(objectTypes.map((o) => o.type))
+    for (const resolver of inventoryModule.resolvers ?? [])
+      expect({ type: resolver.type, declared: declared.has(resolver.type) }).toEqual({
+        type: resolver.type,
+        declared: true,
+      })
+    for (const type of (inventoryModule.search ?? []).flatMap((s) => s.types))
+      expect({ type, declared: declared.has(type) }).toEqual({ type, declared: true })
+  })
+
+  it('offers a full reindex as well as a single load', () => {
+    // Without `scan`, `core.search.reindex` walks this module and finds nothing to do — silently,
+    // which is the worst way for a repair mechanism to be missing.
+    for (const indexer of inventoryModule.search ?? [])
+      expect({ types: indexer.types, scan: typeof indexer.scan }).toEqual({
+        types: indexer.types,
+        scan: 'function',
+      })
+  })
+
+  it('gives every scheduled job a name of its own and a schedule', () => {
+    const jobs = inventoryModule.jobs ?? []
+    expect(jobs.length, 'a module with sweeps declares them').toBeGreaterThan(0)
+    expect(new Set(jobs.map((j) => j.name)).size, 'two jobs sharing a name share a queue').toBe(jobs.length)
+    // Every job this module has is a sweep; one without a cron would be a queue nothing enqueues.
+    for (const job of jobs)
+      expect({ job: job.name, cron: typeof job.cron }).toEqual({ job: job.name, cron: 'string' })
+  })
+
+  it('names every notification type under its own module id', () => {
+    for (const type of inventoryModule.definition.notificationTypes ?? [])
+      expect(type.type.startsWith(`${MODULE_ID}.`), type.type).toBe(true)
+  })
+
+  /**
+   * A notification type nothing sends is the same lie as a permission nothing checks — and unlike a
+   * permission there is no middleware to inspect, so this reads the server for the string.
+   *
+   * Crude on purpose, and honest about it: it proves the *literal* appears in a file that sends
+   * notifications, not that the branch is reachable. A type whose key was built by concatenation
+   * would slip past it. Every one of this module's four is a literal at its call site, and keeping
+   * them that way is the point — a notification type assembled at runtime is one nobody can grep
+   * for either.
+   */
+  it('has a sender in the server for every notification type it declares', () => {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const sources = readdirSync(join(here, 'server'), { recursive: true, encoding: 'utf8' })
+      .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
+      .map((f) => readFileSync(join(here, 'server', f), 'utf8'))
+      .join('\n')
+    for (const { type } of inventoryModule.definition.notificationTypes ?? [])
+      expect({ type, sent: sources.includes(`'${type}'`) }).toEqual({ type, sent: true })
   })
 })

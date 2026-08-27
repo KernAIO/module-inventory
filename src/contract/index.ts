@@ -10,6 +10,7 @@
 export * from './capabilities.js'
 export * from './events.js'
 export * from './models.js'
+export * from './notifications.js'
 export * from './permissions.js'
 export * from './router.js'
 export * from './settings.js'

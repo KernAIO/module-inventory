@@ -1,0 +1,23 @@
+-- One open repair per asset.
+--
+-- Generated from `src/server/schema.ts` with `pnpm db:generate` and then guarded, in that order —
+-- generating first is what keeps the file the schema's own output rather than a hand-written guess
+-- at it.
+--
+-- **Append-only.** 0.2.0 is published and `core` depends on it, so this file adds an index and
+-- nothing else: no table is created, dropped, renamed or narrowed, and the 0.2.0 image reads the
+-- schema afterwards exactly as it read it before. Rolling that image back needs no dump.
+--
+-- **The guard is not decoration.** A module's migrations are the first thing the kernel runs, so one
+-- that throws does not break its own feature — it takes down the whole host service, and `core`
+-- hosts five modules. drizzle emits a bare `CREATE UNIQUE INDEX` here; `if not exists` is added by
+-- hand, and `migrations.test.ts` applies this folder twice against a database created from nothing
+-- to prove the guard is real rather than intended.
+--
+-- Why an index and not a service check: two people pressing *Send for repair* on the same laptop in
+-- the same instant both read "it is here" and both insert. Checking first and inserting after is the
+-- race, not the fix. Custody settles the same problem with a GiST exclusion constraint; a repair has
+-- no range to overlap, only a flag, so a partial unique index says exactly the same thing more
+-- cheaply. `RepairService` translates the resulting 23505 into a sentence.
+
+CREATE UNIQUE INDEX IF NOT EXISTS "inventory_repairs_one_open_uq" ON "mod_inventory"."repairs" USING btree ("asset_id") WHERE returned_on is null;

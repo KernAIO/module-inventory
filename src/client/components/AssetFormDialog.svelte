@@ -1,11 +1,23 @@
 <script lang="ts">
-import { Button, Dialog, Field, Input, messageLocale, Select, Textarea, toast } from '@kernhq/ui'
-import { createMutation, useQueryClient } from '@tanstack/svelte-query'
-import type { Asset } from '../../contract/index.js'
+import {
+  Button,
+  Dialog,
+  Field,
+  Input,
+  messageLocale,
+  Select,
+  type SelectOption,
+  Textarea,
+  toast,
+} from '@kernhq/ui'
+import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query'
+import type { Asset, Category } from '../../contract/index.js'
 import { getInventoryApi } from '../api-instance.js'
+import { isolated } from '../bidi.js'
+import { errorMessage } from '../errors.js'
 import { t } from '../i18n.js'
 import { canInventory } from '../permissions.js'
-import { formatPrice, parsePrice } from '../price.js'
+import { currencyOptions, formatPrice, parsePrice, priceExample } from '../price.js'
 import { inventoryKeys } from '../query.js'
 
 /**
@@ -39,6 +51,7 @@ $effect(() => {
 
 let name = $state('')
 let description = $state('')
+let categoryId = $state('')
 let serialNumber = $state('')
 let location = $state('')
 let purchasedOn = $state('')
@@ -66,16 +79,43 @@ $effect(() => {
   fill(asset)
 })
 
+/**
+ * What this asset can be filed under.
+ *
+ * Archived categories are asked for as well, so a row that already carries one keeps naming it —
+ * the picker offers only live categories plus whichever this asset is already in. Without the
+ * second half, opening the form on an asset in an archived category would silently show "no
+ * category" and saving would move it out of one nobody meant to leave.
+ *
+ * `enabled` on `open` rather than always: this dialog is mounted by the list page for its whole
+ * life, and a picker nobody has opened does not need a request. The key is the page's own, so when
+ * it does fire the answer is usually already in the cache.
+ */
+const categoriesQuery = createQuery(() => ({
+  queryKey: inventoryKeys.categories(workspaceId, true),
+  queryFn: () => api.categories.list({ workspaceId, archived: true }),
+  enabled: Boolean(workspaceId) && shown,
+}))
+
+const categoryOptions = $derived<SelectOption[]>([
+  { value: '', label: t('category_none') },
+  ...(categoriesQuery.data ?? [])
+    .filter((row: Category) => !row.archivedAt || row.id === categoryId)
+    .map((row: Category) => ({ value: row.id, label: row.name })),
+])
+
 function fill(row: Asset | null) {
   name = row?.name ?? ''
   description = row?.description ?? ''
+  categoryId = row?.categoryId ?? ''
   serialNumber = row?.serialNumber ?? ''
   location = row?.location ?? ''
   purchasedOn = row?.purchasedOn ?? ''
   purchasedFrom = row?.purchasedFrom ?? ''
-  // Formatted for the reader's own locale, and `parsePrice` reads back exactly what this writes.
-  priceText = formatPrice(row?.priceMinor, messageLocale())
   currency = row?.currency ?? ''
+  // Formatted for the reader's own locale *and this row's currency* — `parsePrice` reads back
+  // exactly what this writes only if both halves agree on how many decimal places the money has.
+  priceText = formatPrice(row?.priceMinor, messageLocale(), currency || null)
   warrantyUntil = row?.warrantyUntil ?? ''
 }
 
@@ -91,10 +131,18 @@ const close = () => {
  * Turkish and Persian for twelve hundred — was stored as €1.23, and `abc` and `-5` were stored as
  * no price at all. Neither said anything. Now an amount this locale cannot read is an error on the
  * field, and there is no path where a wrong number is saved quietly.
+ *
+ * The **currency** is a dependency of the parse, not decoration beside it: yen has no minor unit
+ * and the dinar has three, so the same keystrokes mean different money in different currencies.
+ * Switching the picker re-parses what is already typed, which is what makes `1000` in a yen field
+ * ¥1000 rather than ¥10 — and `19.99` there an error rather than a silent ¥20.
  */
-const priceResult = $derived(parsePrice(priceText, messageLocale()))
+const currencyCode = $derived(currency.trim().toUpperCase() || null)
+const priceResult = $derived(parsePrice(priceText, messageLocale(), currencyCode))
 const priceError = $derived(
-  priceResult.ok ? null : t('price_invalid', { example: formatPrice(123456, messageLocale()) }),
+  priceResult.ok
+    ? null
+    : t('price_invalid', isolated({ example: priceExample(messageLocale(), currencyCode) })),
 )
 
 /**
@@ -110,13 +158,15 @@ let submitting = $state(false)
 const fields = () => ({
   name: name.trim(),
   description: description.trim(),
+  // `null`, never `''`: the contract takes a uuid or nothing, and an empty string is neither.
+  categoryId: categoryId || null,
   serialNumber: serialNumber.trim() || null,
   location: location.trim() || null,
   purchasedFrom: purchasedFrom.trim() || null,
   purchasedOn: purchasedOn || null,
   warrantyUntil: warrantyUntil || null,
   priceMinor: priceResult.ok ? priceResult.minor : null,
-  currency: currency.trim().toUpperCase() || null,
+  currency: currencyCode,
 })
 
 const save = createMutation(() => ({
@@ -129,11 +179,12 @@ const save = createMutation(() => ({
   onSuccess: (saved: Asset) => {
     // Not `t('new')`: that is the label on the button that opened this, so the toast used to
     // congratulate somebody on the words "New asset" rather than telling them what happened.
-    toast.success(t(editing ? 'updated_toast' : 'created_toast', { name: saved.name }))
+    toast.success(t(editing ? 'updated_toast' : 'created_toast', isolated({ name: saved.name })))
     void queryClient.invalidateQueries({ queryKey: inventoryKeys.all })
     close()
   },
-  onError: (error: Error) => toast.error(error.message || t('common.error')),
+  // Translated rather than the server's English prose: see `errors.ts`.
+  onError: (error: unknown) => toast.error(errorMessage(error, t)),
   onSettled: () => {
     submitting = false
   },
@@ -173,6 +224,12 @@ function submit() {
     <Field label={t('description')} id="inv-desc">
       {#snippet children(id)}
         <Textarea {id} bind:value={description} rows={2} />
+      {/snippet}
+    </Field>
+
+    <Field label={t('category')} id="inv-category">
+      {#snippet children(id)}
+        <Select {id} bind:value={categoryId} options={categoryOptions} ariaLabel={t('category')} />
       {/snippet}
     </Field>
 
@@ -221,17 +278,9 @@ function submit() {
              Persian, Arabic, German or Turkish form, explained by an example that is not a hint. -->
         <Field label={t('currency')} id="inv-currency">
           {#snippet children(id)}
-            <Select
-              {id}
-              bind:value={currency}
-              options={[
-                { value: '', label: '—' },
-                { value: 'USD', label: 'USD' },
-                { value: 'EUR', label: 'EUR' },
-                { value: 'IRR', label: 'IRR' },
-                { value: 'AED', label: 'AED' },
-              ]}
-            />
+            <!-- The list lives in `price.ts`: the repair form asks the same question, and two
+                 copies are two lists that gain a currency in one form and not the other. -->
+            <Select {id} bind:value={currency} options={currencyOptions('—')} />
           {/snippet}
         </Field>
       </div>

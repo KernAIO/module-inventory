@@ -1,8 +1,29 @@
 import { baseContract, PageInput, page } from '@kernhq/contracts'
 import { z } from 'zod'
-import { Asset, AssetCreateInput, AssetPatchInput, AssetSort, AssetStatus, ws } from './models.js'
+import {
+  Asset,
+  AssetCreateInput,
+  AssetHistoryEntry,
+  AssetPatchInput,
+  AssetSort,
+  AssetStatus,
+  Attachment,
+  Category,
+  CategoryInput,
+  CustodyPeriod,
+  CustodyResult,
+  InventoryStats,
+  RepairInput,
+  RepairListItem,
+  RepairPatchInput,
+  RepairResult,
+  ws,
+} from './models.js'
 
 const t = ['inventory'] as const
+
+/** A handover note is optional everywhere and shaped the same everywhere. */
+const custodyNote = z.string().max(500).nullish()
 
 export const inventoryContract = {
   assets: {
@@ -41,6 +62,239 @@ export const inventoryContract = {
       .route({ method: 'POST', path: '/assets/{assetId}/archive', tags: t })
       .input(ws.extend({ assetId: z.uuid(), archived: z.boolean().default(true) }))
       .output(Asset),
+    /**
+     * The asset's own timeline, newest first.
+     *
+     * Paged with the same keyset discipline `assets.list` uses and the same cursor codec, because a
+     * second bookmark format is a second set of the three bugs the first one had. The bookmark is a
+     * row id; the ordering is by id, which for a uuidv7 is the clock and, unlike `created_at`, is
+     * unique — two entries written in one transaction (a create and its first custody row) share a
+     * timestamp and a page boundary between them would repeat or drop one.
+     *
+     * Reads on `inventory.asset.view`. See `permissions.ts` for why custody is not gated separately.
+     */
+    history: baseContract
+      .route({ method: 'GET', path: '/assets/{assetId}/history', tags: t })
+      .input(ws.extend({ assetId: z.uuid(), ...PageInput.shape }))
+      .output(page(AssetHistoryEntry)),
+  },
+
+  /**
+   * Who is holding what.
+   *
+   * Four verbs rather than one, because "hand it to somebody" and "hand it on to somebody else" are
+   * different questions with different failure modes: assigning something already out is a mistake
+   * worth refusing, and transferring something nobody holds is a different mistake. One procedure
+   * taking `userId | null` would answer both by silently doing whatever the row happened to allow.
+   */
+  custody: {
+    /** Hand a free item to a member. Refuses if somebody already has it — that is `transfer`. */
+    assign: baseContract
+      .route({ method: 'POST', path: '/assets/{assetId}/custody', tags: t })
+      .input(ws.extend({ assetId: z.uuid(), userId: z.uuid(), note: custodyNote }))
+      .output(CustodyResult),
+    /** Take it back. Closes the open period and puts the asset back in stock. */
+    return: baseContract
+      .route({ method: 'POST', path: '/assets/{assetId}/custody/return', tags: t })
+      .input(ws.extend({ assetId: z.uuid(), note: custodyNote }))
+      .output(CustodyResult),
+    /**
+     * Hand it straight on: one transaction, not a return followed by an assign.
+     *
+     * Two calls would leave the asset `in_stock` with no custodian in between — visible to anybody
+     * reading the list at that moment, and permanently visible in the timeline as a return that
+     * nobody performed.
+     */
+    transfer: baseContract
+      .route({ method: 'POST', path: '/assets/{assetId}/custody/transfer', tags: t })
+      .input(ws.extend({ assetId: z.uuid(), userId: z.uuid(), note: custodyNote }))
+      .output(CustodyResult),
+    /**
+     * Every period for one asset, newest first — "who had this laptop before me".
+     *
+     * An array rather than a page, like HR's `employment.history`: the rows are bounded by how many
+     * times one item changed hands, which is tens over its life. `limit` caps it rather than
+     * paging, so the answer is never unbounded and the caller never has a cursor to keep.
+     */
+    history: baseContract
+      .route({ method: 'GET', path: '/assets/{assetId}/custody', tags: t })
+      .input(ws.extend({ assetId: z.uuid(), limit: z.number().int().min(1).max(200).default(100) }))
+      .output(z.array(CustodyPeriod)),
+    /**
+     * What one person is holding right now.
+     *
+     * Answered from `assets.custodian_user_id` — denormalised inside the same transaction that
+     * writes the period, and indexed — rather than from an open-period join, so the offboarding
+     * question ("what does Ada still have?") is one indexed read.
+     */
+    byUser: baseContract
+      .route({ method: 'GET', path: '/custody/by-user/{userId}', tags: t })
+      .input(ws.extend({ userId: z.uuid(), ...PageInput.shape }))
+      .output(page(Asset)),
+  },
+
+  /**
+   * How a workspace groups what it owns.
+   *
+   * Not paged: a workspace has tens of categories, and every one of them has to be in the picker
+   * anyway. A cursor here would be a page boundary in a dropdown.
+   */
+  categories: {
+    list: baseContract
+      .route({ method: 'GET', path: '/categories', tags: t })
+      .input(ws.extend({ archived: z.boolean().default(false) }))
+      .output(z.array(Category)),
+    create: baseContract
+      .route({ method: 'POST', path: '/categories', tags: t })
+      .input(ws.extend(CategoryInput.shape))
+      .output(Category),
+    update: baseContract
+      .route({ method: 'PATCH', path: '/categories/{categoryId}', tags: t })
+      .input(ws.extend({ categoryId: z.uuid(), ...CategoryInput.partial().shape }))
+      .output(Category),
+    /**
+     * Archive, not delete — and the same procedure restores.
+     *
+     * `assets.category_id` carries no foreign key, so a delete would leave every asset filed under
+     * it pointing at nothing: a blank column, and a timeline entry that recorded the move losing
+     * the name it recorded. Archiving is reversible and destroys nothing.
+     */
+    archive: baseContract
+      .route({ method: 'POST', path: '/categories/{categoryId}/archive', tags: t })
+      .input(ws.extend({ categoryId: z.uuid(), archived: z.boolean().default(true) }))
+      .output(Category),
+  },
+
+  /**
+   * What went away to be fixed.
+   *
+   * **Behind the `repairs` capability**, which is this module's first switchable one — so every
+   * procedure here answers **404** rather than 403 in a workspace that has it off. 403 would say
+   * "this exists and you may not have it", which is false for a company that does not record
+   * repairs, and it would contradict a panel that has already hidden the tab.
+   *
+   * Writing takes `inventory.repair.manage`; reading rides `inventory.asset.view`, for the reason
+   * custody does — "where is the projector" is the question the register exists to answer.
+   */
+  repairs: {
+    /**
+     * One asset's repairs, or the whole workspace's — the same procedure, because they are the same
+     * query with one filter and a second one would be a second thing to keep in step.
+     *
+     * `open: true` is the "what is away right now" question a dashboard card asks, and it is a
+     * filter rather than a procedure of its own for the same reason.
+     *
+     * Paged, unlike `custody.history`: one asset's repairs are bounded by how often it breaks, but
+     * a workspace's are not. Ordered newest-logged first, by row id — a uuidv7 already carries the
+     * clock and is unique, where `sent_on` is a date two repairs logged the same day share.
+     */
+    list: baseContract
+      .route({ method: 'GET', path: '/repairs', tags: t })
+      .input(
+        ws.extend({
+          ...PageInput.shape,
+          assetId: z.uuid().optional(),
+          /** `true` for still away, `false` for finished, absent for both. */
+          open: z.boolean().optional(),
+        }),
+      )
+      .output(page(RepairListItem)),
+    /**
+     * Send it away. Refuses when the item is already at a repairer — one open repair per asset, and
+     * `inventory_repairs_one_open_uq` is what makes that true in the database rather than merely
+     * likely in the service.
+     *
+     * `sentOn` is optional and defaults to today **on the server**: a browser clock is not a fact
+     * this module is willing to record, and the same reasoning already keeps asset tags server-side.
+     */
+    create: baseContract
+      .route({ method: 'POST', path: '/assets/{assetId}/repairs', tags: t })
+      .input(ws.extend({ assetId: z.uuid(), ...RepairInput.shape }))
+      .output(RepairResult),
+    /**
+     * Correct what was recorded — a vendor, a cost that arrived with the invoice a week later.
+     *
+     * Deliberately cannot set `returnedOn`: that one column decides whether the asset reads as
+     * `under_repair`, so exactly one procedure moves it and the derived status has one door rather
+     * than two.
+     */
+    update: baseContract
+      .route({ method: 'PATCH', path: '/repairs/{repairId}', tags: t })
+      .input(ws.extend({ repairId: z.uuid(), ...RepairPatchInput.shape }))
+      .output(RepairResult),
+    /**
+     * It came back. Closes the repair and puts the asset back to `assigned` if somebody still holds
+     * it, or `in_stock` if nobody does — never blindly to `in_stock`, which would quietly release
+     * whoever is answerable for it.
+     *
+     * Takes the cost, because that is when the invoice usually arrives.
+     */
+    complete: baseContract
+      .route({ method: 'POST', path: '/repairs/{repairId}/complete', tags: t })
+      .input(
+        ws.extend({
+          repairId: z.uuid(),
+          returnedOn: z.iso.date().optional(),
+          costMinor: z.number().int().min(0).nullish(),
+          currency: z.string().length(3).nullish(),
+        }),
+      )
+      .output(RepairResult),
+  },
+
+  /**
+   * Receipts, warranties, manuals — and the asset's photo, which is an `Asset` field rather than one
+   * of these.
+   *
+   * **Behind the `attachments` capability**, so these answer 404 in a workspace that has it off.
+   *
+   * **A module does not upload.** The browser sends the bytes to core's file service and hands this
+   * module the id core gave it; `add` records that this asset has that file. Nothing here streams,
+   * signs or stores anything, and `remove` detaches rather than deleting core's file — the same
+   * bytes may be attached elsewhere, and a module has no standing to destroy another module's row.
+   */
+  attachments: {
+    /**
+     * Every file on one asset, its repairs' included, each carrying its own `repairId`.
+     *
+     * Not paged and not filtered by repair: one asset's files are bounded and entirely loaded, so
+     * the panel groups them in the browser. That is the one case where filtering client-side is
+     * right, and it is the opposite of what `assets.list` may do.
+     */
+    list: baseContract
+      .route({ method: 'GET', path: '/assets/{assetId}/attachments', tags: t })
+      .input(ws.extend({ assetId: z.uuid() }))
+      .output(z.array(Attachment)),
+    /** Attach files core already holds. `repairId` files them under one repair instead of the asset. */
+    add: baseContract
+      .route({ method: 'POST', path: '/assets/{assetId}/attachments', tags: t })
+      .input(
+        ws.extend({
+          assetId: z.uuid(),
+          fileIds: z.array(z.uuid()).min(1).max(20),
+          repairId: z.uuid().nullish(),
+        }),
+      )
+      .output(z.array(Attachment)),
+    /** Answers with the id it detached, so a client can drop exactly that row without re-reading. */
+    remove: baseContract
+      .route({ method: 'DELETE', path: '/attachments/{attachmentId}', tags: t })
+      .input(ws.extend({ attachmentId: z.uuid() }))
+      .output(z.object({ id: z.uuid() })),
+  },
+
+  /**
+   * The register in numbers.
+   *
+   * One procedure rather than a `total` on `assets.list`, because they answer different questions:
+   * a list's total describes the filter you asked for, and this describes the workspace. The assets
+   * page needs both — "showing 50 of 214" is two numbers from two places.
+   *
+   * Not behind a capability: it counts assets, which is `core`. `outForRepair` comes back null
+   * rather than 0 where `repairs` is off — see `InventoryStats`.
+   */
+  stats: {
+    summary: baseContract.route({ method: 'GET', path: '/stats', tags: t }).input(ws).output(InventoryStats),
   },
 }
 export type InventoryContract = typeof inventoryContract

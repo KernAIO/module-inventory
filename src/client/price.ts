@@ -21,6 +21,120 @@
 /** `minor: null` is a real answer — an empty field means "no price", not a bad one. */
 export type PriceResult = { ok: true; minor: number | null } | { ok: false }
 
+/**
+ * The currencies a money field offers, in one place because two forms ask for one.
+ *
+ * The asset form and the repair form put the same question — what is this amount in — and a second
+ * copy of the list is a list that gains a currency in one form and not the other. Codes rather than
+ * names: ISO 4217 is what the column stores, and a currency name is one more thing to translate
+ * five times for no gain over the code somebody already reads on their own bank statement.
+ *
+ * **This list was `['USD', 'EUR', 'IRR', 'AED']` in a product that ships Turkish.** A Turkish
+ * workspace could not record what it paid for anything in lira: the contract takes any three-letter
+ * code (`z.string().length(3)`) and the server stores whatever arrives, so the shortage was the
+ * picker's alone — four options, one of which was missing for one of the five languages on the
+ * language menu. TRY, and the currency of every other locale this module ships, is now here.
+ *
+ * The order is deliberate and is not alphabetical: the currency of each shipped language first, in
+ * the order the locales are listed everywhere else in this package (en, ar, de, fa, tr) — so USD,
+ * AED, EUR, IRR, TRY — then the ones a company in those places is most likely to have paid an
+ * invoice in. A picker sorted A–Z puts AED above USD for a reader in Berlin, which is tidy and
+ * useless.
+ *
+ * **The comment said that while the list said `USD, EUR, AED, TRY, IRR`**, which is no order at
+ * all — en, de, ar, tr, fa — so the rule a sixth currency was supposed to be filed under described
+ * something that had never been true. `price.test.ts` now asserts the first five, because a stated
+ * order nothing checks drifts back the first time somebody appends a code.
+ *
+ * It is still a list, not the whole of ISO 4217: all 180 codes in a `<select>` is not a kindness.
+ *
+ * **What a new asset defaults to is deliberately nothing.** The obvious improvement on "the first
+ * code in the list" is "whatever this workspace uses", and that is right — but a workspace currency
+ * does not exist: `InventorySettings` holds the tag prefix, the tag padding and the two notice
+ * windows, and nothing else, so `defaultCurrency` is a contract change rather than something a
+ * picker can invent. The tempting shortcut is to read it off the reader's locale, and that is
+ * *worse* than no default: two colleagues in one workspace, one reading German and one reading
+ * Turkish, would be handed different pre-selected currencies for the same register, notice nothing,
+ * and store EUR against one laptop and TRY against the next. A currency is a fact about the
+ * company, not about the language somebody happens to read the screen in. So the forms seed from
+ * the *record* — a repair inherits its asset's currency, an edit keeps its own — and a new asset
+ * starts empty, which asks the question instead of answering it wrongly.
+ */
+export const CURRENCIES = [
+  'USD',
+  'AED',
+  'EUR',
+  'IRR',
+  'TRY',
+  'GBP',
+  'SAR',
+  'QAR',
+  'KWD',
+  'EGP',
+  'CHF',
+  'SEK',
+  'NOK',
+  'DKK',
+  'PLN',
+  'CAD',
+  'AUD',
+  'JPY',
+  'CNY',
+  'INR',
+] as const
+
+/**
+ * The options both money fields offer, built once.
+ *
+ * The empty option is first and is a real answer: an asset with no price has no currency either,
+ * and a picker with no way back to "none" is a field somebody can fill in and never clear.
+ */
+export function currencyOptions(noneLabel: string): Array<{ value: string; label: string }> {
+  return [{ value: '', label: noneLabel }, ...CURRENCIES.map((code) => ({ value: code, label: code }))]
+}
+
+const EXPONENTS: Map<string, number> = new Map()
+
+/**
+ * How many decimal places this currency has — asked of the currency, never assumed to be two.
+ *
+ * **This module stored ¥1000 as ¥10 and every KWD amount ten times too small.** `parsePrice` and
+ * `formatPrice` both hard-coded 1/100, and the picker offers JPY, which has *no* minor unit, and
+ * KWD, which has *three* decimal places. So `1000` typed into a yen field became 100000 minor
+ * units, read back as `1000.00`, and was ¥100 000 to anything that read the column honestly — a
+ * silent 100× on exactly the shape of field this file was rewritten to stop silently mangling.
+ *
+ * **IRR is the one that matters most here**, because it is the currency of a language this module
+ * ships: the rial has no minor unit either, so a Persian workspace was the default victim.
+ *
+ * CLDR knows each currency's exponent and `Intl` will hand it over, so nothing is tabulated: a
+ * currency added to `CURRENCIES` next year gets the right answer without anybody remembering this
+ * function exists. A code `Intl` refuses, or one it has never heard of, falls back to two — which
+ * is what ISO 4217 assigns by default, and is the only guess available.
+ *
+ * The locale is fixed at `'en'` deliberately: the exponent is a fact about the *currency*, and
+ * asking under the reader's locale would make the same money parse differently for two colleagues.
+ */
+export function minorUnitExponent(currency: string | null | undefined): number {
+  if (!currency) return 2
+  const cached = EXPONENTS.get(currency)
+  if (cached !== undefined) return cached
+  let exponent = 2
+  try {
+    // `maximumFractionDigits` is optional in the DOM lib and always present in practice for a
+    // currency formatter; `??` is what keeps the two type-checks agreeing about that.
+    exponent =
+      new Intl.NumberFormat('en', { style: 'currency', currency }).resolvedOptions().maximumFractionDigits ??
+      2
+  } catch {
+    // A malformed code — the contract takes any three letters and the picker is not the only way
+    // in. Two decimals is ISO 4217's own default and keeps the field usable.
+  }
+  if (!Number.isInteger(exponent) || exponent < 0 || exponent > 4) exponent = 2
+  EXPONENTS.set(currency, exponent)
+  return exponent
+}
+
 interface Separators {
   group: string
   decimal: string
@@ -86,8 +200,18 @@ function isGroupedInteger(text: string, group: string): boolean {
  *
  * Returns `{ ok: false }` for anything that is not a non-negative number in `locale` — including a
  * negative one, which the contract has no way to mean and the old parser dropped in silence.
+ *
+ * `currency` decides how many decimal places the amount is allowed and what it is scaled by. More
+ * fractional digits than the currency has is a **rejection, not a rounding**: `19.99` in a yen
+ * field is not ¥20, it is somebody who has not noticed which field they are in, and quietly
+ * storing a number nobody typed is the whole class of failure this file exists to end. Omitting
+ * `currency` keeps two decimals, which is what an amount with no currency on it has always meant.
+ *
+ * The scaled integer is built by **concatenating digits**, never by multiplying: `19.99 * 100` is
+ * `1998.9999999999998` in a double, and the `Math.round` that used to hide it would have had to
+ * hide `1234.567 * 1000` too. Digits in, digits out, and no float on the path at all.
  */
-export function parsePrice(raw: string, locale: string): PriceResult {
+export function parsePrice(raw: string, locale: string, currency?: string | null): PriceResult {
   const text = toLatinDigits(raw).replace(BIDI, '').trim()
   if (!text) return { ok: true, minor: null }
 
@@ -103,11 +227,12 @@ export function parsePrice(raw: string, locale: string): PriceResult {
   if (!isGroupedInteger(whole, group)) return { ok: false }
   if (frac !== undefined && !/^\d+$/.test(frac)) return { ok: false }
 
-  const digits = group ? whole.split(group).join('') : whole
-  const value = Number(`${digits}.${frac ?? '0'}`)
-  if (!Number.isFinite(value)) return { ok: false }
+  const exponent = minorUnitExponent(currency)
+  // A currency with no minor unit has no decimal point either, so `frac` of any length fails here.
+  if (frac !== undefined && frac.length > exponent) return { ok: false }
 
-  const minor = Math.round(value * 100)
+  const digits = group ? whole.split(group).join('') : whole
+  const minor = Number(`${digits}${(frac ?? '').padEnd(exponent, '0')}`)
   // A price that cannot survive the round trip through a double is not a price anybody typed.
   if (!Number.isSafeInteger(minor)) return { ok: false }
   return { ok: true, minor }
@@ -119,17 +244,36 @@ export function parsePrice(raw: string, locale: string): PriceResult {
  * The edit form has to seed itself from `priceMinor`, and seeding it with `1234.56` for a German
  * reader would make them look at a number their own locale says is €123,456 — then `parsePrice`
  * would reject it on the grouping rule and they would be told their own data is invalid. What comes
- * out of here is exactly what goes back in.
+ * out of here is exactly what goes back in, for the currency the amount is in.
  */
-export function formatPrice(minor: number | null | undefined, locale: string): string {
+export function formatPrice(
+  minor: number | null | undefined,
+  locale: string,
+  currency?: string | null,
+): string {
   if (minor === null || minor === undefined) return ''
+  const exponent = minorUnitExponent(currency)
+  const value = minor / 10 ** exponent
   try {
     return new Intl.NumberFormat(locale, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
+      minimumFractionDigits: exponent,
+      maximumFractionDigits: exponent,
       useGrouping: false,
-    }).format(minor / 100)
+    }).format(value)
   } catch {
-    return String(minor / 100)
+    return String(value)
   }
+}
+
+/**
+ * The amount the "enter an amount like…" error holds up as an example.
+ *
+ * It has to be an amount the field would *accept*, or the error tells somebody to type something
+ * that is also rejected. `1234.56` was hard-coded, so a yen field said "Enter an amount like
+ * 1234.56" and then refused it. Built from the exponent instead: `1234` in yen, `1234.567` in
+ * dinars, and the reader's own separators and digits around it either way.
+ */
+export function priceExample(locale: string, currency?: string | null): string {
+  const exponent = minorUnitExponent(currency)
+  return formatPrice(Number(`1234${'567'.slice(0, exponent).padEnd(exponent, '0')}`), locale, currency)
 }

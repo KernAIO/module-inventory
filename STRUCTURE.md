@@ -22,7 +22,8 @@ small module and one that runs its own process.
 
 If your module is request/response — a form, a list, a report — leave `src/service/` out. `core`
 hosts it: its router is mounted at `/api/<id>`, its migrations run, its jobs are scheduled, and you
-write no server plumbing at all. Four of the six modules Kern ships with are like this.
+write no server plumbing at all. Five of the seven modules Kern ships with are like this — only
+`chat` and `mail` host themselves.
 
 ```jsonc
 // src/server/index.ts — the default, and you can omit it entirely

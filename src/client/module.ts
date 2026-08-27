@@ -87,6 +87,42 @@ export const inventoryClientModule = defineClientModule({
       ],
       component: () => import('./widgets/OverviewWidget.svelte'),
     },
+    {
+      /**
+       * A second card rather than a `view` option on the first, because this one is gated.
+       *
+       * `capability` is what the shell filters the dashboard by, so a workspace that does not
+       * record repairs is never offered this card at all. An option inside the other card's
+       * settings would offer the question and then answer it with an empty card — which is exactly
+       * the "a switch that changes nothing" failure the capability mechanism exists to avoid.
+       */
+      id: 'inventory.repairs',
+      get title() {
+        return t('widget_repairs_title')
+      },
+      get description() {
+        return t('widget_repairs_desc')
+      },
+      icon: 'wrench',
+      permission: INVENTORY_PERMISSIONS.view,
+      capability: 'repairs',
+      sizes: ['m', 'l'],
+      defaultSize: 'm',
+      order: 56,
+      settings: [
+        {
+          kind: 'number',
+          key: 'limit',
+          get label() {
+            return t('common.setting_rows')
+          },
+          default: 5,
+          min: 3,
+          max: 20,
+        },
+      ],
+      component: () => import('./widgets/RepairsWidget.svelte'),
+    },
   ],
 
   /**
@@ -109,6 +145,24 @@ export const inventoryClientModule = defineClientModule({
       permission: 'core.modules.manage',
       order: 1,
       component: () => import('./settings/GeneralSettings.svelte'),
+    },
+    {
+      /**
+       * Categories are this module's own data rather than core's, so this one is gated on this
+       * module's own key — `inventory.category.manage`, which is exactly what `categories.create`,
+       * `.update` and `.archive` require on the server. General above is gated on
+       * `core.modules.manage` because *that* page writes through core's settings procedure; the two
+       * pages sit side by side and are deliberately not gated the same way.
+       */
+      id: 'categories',
+      get label() {
+        return t('settings_categories')
+      },
+      icon: 'tag',
+      scope: 'workspace',
+      permission: INVENTORY_PERMISSIONS.categories,
+      order: 2,
+      component: () => import('./settings/CategoriesSettings.svelte'),
     },
   ],
 })
