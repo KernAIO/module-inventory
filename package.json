@@ -1,6 +1,6 @@
 {
   "name": "@kernhq/module-inventory",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Kern inventory module: the company's asset register — what it owns, item by item, with asset tags, serial numbers, purchase and warranty details",
   "homepage": "https://github.com/KernAIO/module-inventory#readme",
   "license": "AGPL-3.0-only",

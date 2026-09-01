@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.2
+
+### Patch Changes
+
+- affd87b: Peer @kernhq/ui ^0.14.0 to match the published minor (check-ranges).
+
 ## 0.4.1
 
 ### Patch Changes
