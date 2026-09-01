@@ -88,13 +88,13 @@ interface Reached {
 }
 
 type MiddlewareFn = (
-  options: { context: unknown; next: (options?: unknown) => Promise<unknown> },
+  options: { context: unknown; procedure?: unknown; next: (options?: unknown) => Promise<unknown> },
   input: unknown,
 ) => Promise<unknown>
 
 const WORKSPACE = '00000000-0000-4000-8000-000000000000'
 
-async function reachedFor(middleware: unknown): Promise<Reached> {
+async function reachedFor(middleware: unknown, procedure: unknown): Promise<Reached> {
   const seen: Reached = {}
   const kernel = {
     authz: {
@@ -114,10 +114,30 @@ async function reachedFor(middleware: unknown): Promise<Reached> {
         return true
       },
     }),
+    // kernel 0.9.1 added two gates inside workspaceScoped, after the membership check. Both must
+    // fall open here: nothing bills in a test, so the API budget never refuses and entitlements
+    // answer source 'none' — the shape a self-hosted instance runs with (falls open on purpose).
+    apiBudget: {
+      check: async () => ({ ok: true, limit: 60, retryAfterSec: 60 }),
+    },
+    entitlements: {
+      of: async () => ({ source: 'none', active: true }),
+      requireActive: async () => undefined,
+    },
   }
   const principal = { kind: 'user', userId: WORKSPACE, instanceAdmin: false, memberships: [] }
+  // kernel 0.9.1's workspaceScoped reads the procedure's `~orpc` (route method + middlewares) to
+  // decide whether the subscription gate applies. Builder views in the implemented router do not
+  // always carry a route (or the full `~orpc`); give any such view the shape of a plain non-reading
+  // procedure, so the gate reads safely and falls open through entitlements `source: 'none'`.
+  const proc = procedure as { '~orpc'?: { route?: unknown; middlewares?: unknown } } | undefined
+  const normalized = proc?.['~orpc']
+    ? proc['~orpc'].route
+      ? procedure
+      : { '~orpc': { ...proc['~orpc'], route: {} } }
+    : { '~orpc': { route: {}, middlewares: [] } }
   await (middleware as MiddlewareFn)(
-    { context: { kernel, principal }, next: async () => ({}) },
+    { context: { kernel, principal }, procedure: normalized, next: async () => ({}) },
     { workspaceId: WORKSPACE },
   )
   return seen
@@ -129,7 +149,8 @@ const chainOf = (name: string): unknown[] => implemented[name]?.['~orpc'].middle
 async function resolveChains(): Promise<Record<string, Reached[]>> {
   const entries = await Promise.all(
     Object.keys(implemented).map(
-      async (name) => [name, await Promise.all(chainOf(name).map(reachedFor))] as const,
+      async (name) =>
+        [name, await Promise.all(chainOf(name).map((m) => reachedFor(m, implemented[name])))] as const,
     ),
   )
   return Object.fromEntries(entries)
@@ -160,13 +181,13 @@ function ungated(capability: string, names: readonly string[], chains: Record<st
 }
 
 describe('every procedure is authorised', () => {
-  const declaredKeys = new Set(inventoryPermissions.map((p) => p.key))
+  const declaredKeys = new Set<string>(inventoryPermissions.map((p) => p.key))
 
   it('puts the workspace and module gate first, on every procedure', async () => {
     for (const name of Object.keys(implemented)) {
       const [first] = chainOf(name)
       expect(
-        first === undefined ? undefined : (await reachedFor(first)).module,
+        first === undefined ? undefined : (await reachedFor(first, implemented[name])).module,
         `${name}: the first middleware has to be workspaceScoped('${MODULE_ID}') — a real membership, and the module switched on for that workspace`,
       ).toBe(MODULE_ID)
     }
@@ -174,7 +195,13 @@ describe('every procedure is authorised', () => {
 
   it('puts a permission check the module declares after it', async () => {
     for (const name of Object.keys(implemented)) {
-      const asked = (await Promise.all(chainOf(name).slice(1).map(reachedFor)))
+      const asked = (
+        await Promise.all(
+          chainOf(name)
+            .slice(1)
+            .map((m) => reachedFor(m, implemented[name])),
+        )
+      )
         .map((r) => r.permission)
         .filter((p) => p !== undefined)
       expect(
