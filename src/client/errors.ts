@@ -31,7 +31,7 @@
  * what this file still must never reach for is `i18n.ts`, which drags a Svelte compiler in behind it.
  */
 
-import { MAX_LIVE_CATEGORIES } from '../contract/models.js'
+import { MAX_LIVE_CATEGORIES, MAX_LIVE_FIELDS } from '../contract/models.js'
 
 /** What oRPC hands a screen. `code` is the contract's `ErrorCode`; `data` is what the server put in it. */
 export interface ServerError {
@@ -129,9 +129,42 @@ const REASON_KEYS: Record<string, string> = {
   'inventory.category.name_taken': 'error_category_name_taken',
   'inventory.category.order_stale': 'error_category_order_stale',
   'inventory.category.limit_reached': 'error_category_limit_reached',
+  // What somebody said happened to an item, and the refusals around it.
+  'inventory.asset.archived': 'error_asset_archived',
+  'inventory.asset.already_disposed': 'error_asset_already_disposed',
+  'inventory.asset.not_disposed': 'error_asset_not_disposed',
+  'inventory.custody.disposed': 'error_custody_disposed',
+  'inventory.repair.disposed': 'error_repair_disposed',
+  // The workspace's own fields. The four that name a field arrive as `BAD_REQUEST` with the reason
+  // *and* the field's name in `data` — `KernError.badRequest` carries details where `conflict`
+  // carries a reason, and `kernErrorToORPC` folds both into `data` — so `errorLine` reads
+  // `data.field` for the sentence's placeholder.
+  'inventory.field.key_taken': 'error_field_key_taken',
+  'inventory.field.order_stale': 'error_field_order_stale',
+  'inventory.field.limit_reached': 'error_field_limit_reached',
+  'inventory.field.unknown': 'error_field_unknown',
+  'inventory.field.archived': 'error_field_archived',
+  'inventory.field.required': 'error_field_required',
+  'inventory.field.invalid': 'error_field_invalid',
+  'inventory.field.no_options': 'error_field_no_options',
+  'inventory.field.options_unused': 'error_field_options_unused',
 }
 
 export const reasonKeys = (): readonly string[] => Object.keys(REASON_KEYS)
+
+/**
+ * The field a refusal is about, when the server named one.
+ *
+ * `FieldService.apply` puts the field's own *name* — not its key — beside the reason, so the
+ * sentence can say «Cost centre is required» in the reader's language without this client having
+ * loaded the definitions. Null when the refusal is not about a field, or is from an older server.
+ */
+export function fieldOf(err: unknown): string | null {
+  if (!err || typeof err !== 'object') return null
+  const data = (err as ServerError).data as { field?: unknown } | undefined
+  const field = data && typeof data === 'object' ? data.field : undefined
+  return typeof field === 'string' && field ? field : null
+}
 
 /**
  * The one refusal whose sentence has a number in it, and where that number comes from.
@@ -143,6 +176,7 @@ export const reasonKeys = (): readonly string[] => Object.keys(REASON_KEYS)
  */
 const REASON_VALUES: Record<string, Record<string, string | number>> = {
   'inventory.category.limit_reached': { max: MAX_LIVE_CATEGORIES },
+  'inventory.field.limit_reached': { max: MAX_LIVE_FIELDS },
 }
 
 /**
@@ -190,8 +224,14 @@ export function errorLine(err: unknown): ErrorLine {
   const reason = reasonOf(err)
   const byReason = reason ? REASON_KEYS[reason] : undefined
   if (byReason) {
-    const values = reason ? REASON_VALUES[reason] : undefined
-    return values ? { key: byReason, detail: null, values } : { key: byReason, detail: null }
+    const field = fieldOf(err)
+    const values = {
+      ...(reason ? REASON_VALUES[reason] : undefined),
+      ...(field ? { field } : undefined),
+    }
+    return Object.keys(values).length
+      ? { key: byReason, detail: null, values }
+      : { key: byReason, detail: null }
   }
 
   const code = codeOf(err)

@@ -10,7 +10,7 @@ import { assets, repairs } from '../schema.js'
 import { decodeMark, encodeMark } from './cursor.js'
 import { violated } from './db-errors.js'
 import type { HistoryInput, NotifyService } from './notify.js'
-import { awayForRepair, deriveStatus, lockAsset } from './status.js'
+import { awayForRepair, deriveStatus, dispositionOf, lockAsset } from './status.js'
 
 type Row = typeof repairs.$inferSelect
 type AssetRow = typeof assets.$inferSelect
@@ -303,6 +303,15 @@ export class RepairService {
         'This item is archived. Restore it before sending it for repair.',
         'inventory.repair.archived',
       )
+    // Nor a lost or retired one: nobody can send away a thing nobody can find, and paying to fix
+    // something the company has written off is a mistake worth naming rather than recording.
+    if (dispositionOf(asset))
+      throw KernError.conflict(
+        asset.disposition === 'lost'
+          ? 'This item is marked lost. Reinstate it before sending it for repair.'
+          : 'This item is retired. Reinstate it before sending it for repair.',
+        'inventory.repair.disposed',
+      )
 
     const sentOn = input.sentOn ?? RepairService.today()
     // Vacuous today, and deliberately here rather than reasoned about: `RepairInput` carries no
@@ -554,7 +563,11 @@ export class RepairService {
         'This item is archived. Restore it before sending it for repair.',
         'inventory.repair.archived',
       )
-    const status = deriveStatus({ custodianUserId: asset.custodianUserId, awayForRepair: away })
+    const status = deriveStatus({
+      custodianUserId: asset.custodianUserId,
+      awayForRepair: away,
+      disposition: dispositionOf(asset),
+    })
     if (status === asset.status) return asset
     const [row] = await tx
       .update(assets)

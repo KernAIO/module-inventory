@@ -26,13 +26,25 @@ const KNOWN = new Set([
   'assigned',
   'transferred',
   'returned',
-  'retired',
+  'archived',
   'restored',
+  'lost',
+  'written_off',
+  'reinstated',
   'repair_logged',
   'repair_completed',
   'attachment_added',
   'attachment_removed',
 ])
+
+/**
+ * Actions an earlier image wrote under a different name, and the name they read as now.
+ *
+ * `archived` was written as `retired` until 0.5.0. The rows are still there and always will be —
+ * nothing edits history — and the word now means something else in this module, so the old rows
+ * are read as the sentence they always meant rather than as the one the word now means.
+ */
+const RENAMED: Record<string, string> = { retired: 'archived' }
 
 /**
  * The message key for one entry's headline.
@@ -44,10 +56,11 @@ const KNOWN = new Set([
  * long as the tab stayed open.
  */
 export function actionKey(action: string): string {
-  return KNOWN.has(action) ? `history_${action}` : 'history_unknown'
+  const current = RENAMED[action] ?? action
+  return KNOWN.has(current) ? `history_${current}` : 'history_unknown'
 }
 
-export const isKnownAction = (action: string): boolean => KNOWN.has(action)
+export const isKnownAction = (action: string): boolean => KNOWN.has(RENAMED[action] ?? action)
 
 /**
  * Which sentence a single field change wants.
@@ -105,10 +118,26 @@ const FIELD_KEYS: Record<string, string> = {
   priceMinor: 'price',
   currency: 'currency',
   photoFileId: 'photo',
+  // The bag itself, which no diff line ever names: a change to a custom value is recorded under
+  // `custom.<key>` — see `customKeyOf` — so this entry exists for `timeline.test.ts`'s rule that
+  // every key of `AssetInput` has a word, and for nothing else.
+  custom: 'custom_fields',
 }
 
 export function fieldKey(field: string): string | null {
   return FIELD_KEYS[field] ?? null
+}
+
+/**
+ * The field key behind a `custom.<key>` diff line, or null for a built-in field.
+ *
+ * A custom value's change is recorded under the key it is stored under, and the *name* to print is
+ * the field definition's — which lives in a query the component holds, not here. So this only says
+ * which key to look up; the component asks its definitions for the word, and prints the key itself
+ * for a field that has since been archived out of the list it loaded, which is ugly and true.
+ */
+export function customKeyOf(field: string): string | null {
+  return field.startsWith('custom.') && field.length > 'custom.'.length ? field.slice('custom.'.length) : null
 }
 
 /**
@@ -175,7 +204,7 @@ export function personIdOf(action: string, data: Record<string, unknown>): strin
   return typeof value === 'string' && value ? value : null
 }
 
-/** The handover note, if whoever handed the item over left one. */
+/** The note, if whoever handed the item over — or marked it lost, or retired it — left one. */
 export function noteOf(data: Record<string, unknown>): string | null {
   const note = data.note
   return typeof note === 'string' && note.trim() ? note.trim() : null

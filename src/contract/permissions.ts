@@ -5,8 +5,7 @@ import { definePermissions } from '@kernhq/contracts'
  * it by default. A workspace can add or remove any of them afterwards with a custom role.
  *
  * A key with nothing checking it is a role editor full of switches that do nothing, so these arrive
- * with the procedures that enforce them — `field.manage` and the stock and purchasing keys with
- * their own phases.
+ * with the procedures that enforce them — the stock and purchasing keys with their own phases.
  *
  * **Reading custody is `asset.view`, and that is a decision rather than an omission.** Who holds an
  * item looks like a privacy question, and it is not one here: `custodianUserId` and `custodySince`
@@ -72,6 +71,19 @@ export const inventoryPermissions = definePermissions([
      */
     key: 'inventory.category.manage',
     label: 'Manage asset categories',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin'],
+    dangerous: false,
+  },
+  {
+    /**
+     * Field definitions are workspace configuration in the same sense categories are — one set of
+     * questions every asset form asks — so the same people hold it. Reading them rides `asset.view`
+     * because the form and the panel need them to render a value; writing a *value* is
+     * `asset.manage`, because a value is part of the asset.
+     */
+    key: 'inventory.field.manage',
+    label: 'Define custom fields',
     scope: 'workspace',
     defaultRoles: ['owner', 'admin'],
     dangerous: false,

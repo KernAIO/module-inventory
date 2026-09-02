@@ -64,13 +64,14 @@ const past = $derived(repairs.filter((row) => row.returnedOn !== null))
  * Which of the three this section may offer, decided in `repairs.ts`.
  *
  * Hidden rather than disabled for somebody without the permission — they may never do it — and
- * empty for an archived item, where the sentence below says why. The server refuses each of these
- * again; this only stops the panel offering a door that will not open.
+ * empty for an archived or a lost or retired item, where the sentence below says why. The server
+ * refuses each of these again; this only stops the panel offering a door that will not open.
  */
 const available = $derived(
   repairActions({
     open: open !== null,
     archived: Boolean(asset.archivedAt),
+    disposed: Boolean(asset.disposition),
     may: canManage,
   }),
 )
@@ -141,6 +142,10 @@ const SKELETON_ROWS = [0, 1]
     {:else if canManage && asset.archivedAt}
       <!-- A disabled control with no explanation is a bug; one sentence says why instead. -->
       <p class="hint">{t('repair_archived_hint')}</p>
+    {:else if canManage && asset.disposition}
+      <!-- Nobody can send away a thing nobody can find, or pay to fix one the company has
+           written off; the server refuses with `inventory.repair.disposed`. -->
+      <p class="hint">{t('repair_disposed_hint')}</p>
     {:else if available.includes('create')}
       <div class="acts">
         <Button size="sm" icon="wrench" onclick={() => onact('create', null)}>{t('repair_new')}</Button>

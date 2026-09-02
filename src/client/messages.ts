@@ -46,6 +46,43 @@ export const en: Record<string, Message> = {
   'inventory.status_under_repair': 'Under repair',
   'inventory.status_lost': 'Lost',
   'inventory.status_retired': 'Retired',
+
+  // ---- what somebody said happened to it, and the order of the list -----------------------
+  'inventory.sort': 'Sort',
+  'inventory.sort_recent': 'Newest first',
+  'inventory.sort_name': 'By name',
+  'inventory.sort_code': 'By tag',
+  'inventory.mark_lost': 'Mark as lost',
+  'inventory.retire': 'Retire',
+  'inventory.reinstate': 'Reinstate',
+  'inventory.lost_since': 'Lost since {date}',
+  'inventory.retired_on': 'Retired on {date}',
+  // Each dialog states what happens, not "Are you sure?". A disposition closes doors — the custody
+  // and repair buttons disappear — so the sentence says which ones, and how they open again.
+  'inventory.lost_title': 'Mark {name} as lost?',
+  'inventory.lost_body':
+    'The register will say nobody knows where it is. Whoever is holding it stays answerable for it, and nobody will be able to hand it over until it is reinstated.',
+  'inventory.retire_title': 'Retire {name}?',
+  'inventory.retire_body':
+    'The company is done with it — sold, scrapped or written off. Nobody will be able to hand it over or send it for repair until it is reinstated, and it can then be archived.',
+  'inventory.reinstate_title': 'Reinstate {name}?',
+  'inventory.reinstate_body':
+    'It goes back into service as it was — still with whoever was holding it, or in stock if nobody was.',
+  'inventory.disposition_note': 'Note',
+  'inventory.disposition_note_hint': 'Optional — where it went, who signed it off, what the insurer said.',
+  'inventory.lost_toast': '{name} marked as lost',
+  'inventory.retired_toast': '{name} retired',
+  'inventory.reinstated_toast': '{name} back in service',
+  // Shown in place of the handover and repair buttons on a lost or retired item. Taking it back
+  // stays offered beside the first one: the server allows a return, and the person answerable for
+  // a lost laptop has to be able to stop being answerable for it.
+  'inventory.custody_disposed_hint': 'Reinstate this item before handing it over.',
+  'inventory.repair_disposed_hint': 'Reinstate this item before sending it for repair.',
+  // Under a holder's name: what else they have, minus the item on screen. A link to their list.
+  'inventory.custody_also_holding': {
+    one: 'Also holding {n} other item',
+    other: 'Also holding {n} other items',
+  },
   'inventory.currency': 'Currency',
   'inventory.price_invalid': 'Enter an amount like {example}',
   'inventory.count': { one: '{n} asset', other: '{n} assets' },
@@ -202,9 +239,15 @@ export const en: Record<string, Message> = {
   'inventory.history_assigned': '{actor} handed it to {person}',
   'inventory.history_transferred': '{actor} handed it on to {person}',
   'inventory.history_returned': '{actor} took it back from {person}',
-  'inventory.history_retired': '{actor} archived it',
+  'inventory.history_archived': '{actor} archived it',
   'inventory.history_restored': '{actor} restored it',
+  'inventory.history_lost': '{actor} marked it lost',
+  'inventory.history_written_off': '{actor} retired it',
+  'inventory.history_reinstated': '{actor} put it back into service',
   'inventory.history_unknown': '{actor} changed it — {action}',
+  // The word for the whole bag of custom values, which `fieldKey('custom')` answers and no diff
+  // line ever prints: a change is recorded per key, and the timeline names the field.
+  'inventory.custom_fields': 'Custom fields',
   'inventory.history_set': '{field} set to {to}',
   'inventory.history_cleared': '{field} cleared',
   'inventory.history_changed': '{field} changed from {from} to {to}',
@@ -299,6 +342,71 @@ export const en: Record<string, Message> = {
   'inventory.stats_unassigned': 'Nobody holding',
   'inventory.stats_out_for_repair': 'Out for repair',
 
+  // ---- custom fields ----------------------------------------------------------------------
+  // The settings page, the section on the asset form and the rows on the panel. "Fields" in the
+  // settings rail, because it sits beside "Categories" and "General" and the word "custom" would
+  // be describing every entry there; `custom_fields` above is the heading on the form, where it
+  // sits under the built-in ones and needs the contrast.
+  'inventory.settings_fields': 'Fields',
+  'inventory.settings_fields_desc': 'What this workspace records about an asset beyond the built-in details.',
+  'inventory.fields_error': 'The fields could not be loaded',
+  'inventory.fields_empty': 'No fields yet',
+  'inventory.fields_empty_desc':
+    'Add what the built-in details leave out — a cost centre, a supplier reference, a MAC address — and it is asked for on every asset, or only on the ones in one category.',
+  'inventory.fields_all_archived': 'Every field is archived',
+  'inventory.fields_all_archived_desc': 'Show the archived ones to bring one back, or add a new field.',
+  'inventory.field_new': 'New field',
+  'inventory.field_edit': 'Edit field',
+  // The key is the one thing about a field that cannot change, and the hint says so before anybody
+  // types one: values are stored under it, and renaming it would orphan every one of them.
+  'inventory.field_key': 'Key',
+  'inventory.field_key_hint':
+    'Lowercase letters, digits and underscores, starting with a letter — cost_centre. Values are stored under it, so it cannot be changed once the field exists.',
+  'inventory.field_key_invalid': 'Use lowercase letters, digits and underscores, starting with a letter',
+  'inventory.field_name': 'Name',
+  'inventory.field_name_placeholder': 'Cost centre, Supplier reference, MAC address…',
+  'inventory.field_description': 'Description',
+  'inventory.field_description_hint': 'Shown under the field on the asset form.',
+  'inventory.field_type': 'Type',
+  'inventory.field_type_hint': 'Cannot be changed once the field exists.',
+  'inventory.field_type_text': 'Text',
+  'inventory.field_type_number': 'Number',
+  'inventory.field_type_date': 'Date',
+  'inventory.field_type_select': 'One choice',
+  'inventory.field_type_multiselect': 'Several choices',
+  'inventory.field_type_checkbox': 'Yes or no',
+  'inventory.field_type_url': 'Link',
+  'inventory.field_scope': 'Asked on',
+  'inventory.field_scope_all': 'Every asset',
+  'inventory.field_required': 'Required',
+  'inventory.field_required_desc': 'An asset cannot be saved without a value.',
+  'inventory.field_options': 'Choices',
+  'inventory.field_options_hint': 'One choice per line, in the order they are offered.',
+  // A value is the word itself, so a rename here cannot reach the assets that chose the old one.
+  // Said beside the list rather than discovered on the panel afterwards.
+  'inventory.field_options_rename_note':
+    'Renaming or removing a choice leaves the values already recorded as they were.',
+  'inventory.field_reorder_hint':
+    'Drag a field, or use the arrows on its row, to change the order they appear in on the asset form.',
+  'inventory.field_move_up': 'Move {name} up',
+  'inventory.field_move_down': 'Move {name} down',
+  'inventory.field_position_first': '{name} is first',
+  'inventory.field_position_last': '{name} is last',
+  'inventory.field_position_after': '{name} is after {other}',
+  'inventory.field_created_toast': '{name} added',
+  'inventory.field_updated_toast': '{name} saved',
+  'inventory.field_archived_toast': '{name} archived',
+  'inventory.field_restored_toast': '{name} restored',
+  'inventory.field_archive_title': 'Archive {name}?',
+  // Says what survives — every value already written — which is the reason this archives.
+  'inventory.field_archive_body':
+    'It leaves the asset form and the details panel. Values already recorded under it are kept and stay readable, and you can restore the field at any time.',
+  // On the asset form, under the custom fields, while a required one is still empty. The server
+  // refuses the save too; a form should say so before the button is pressed rather than after.
+  'inventory.custom_missing_required': 'Still to fill in: {field}',
+  'inventory.yes': 'Yes',
+  'inventory.no': 'No',
+
   // ---- what a refusal reads as ------------------------------------------------------------
   // Every screen used to show `error.message`, which is a sentence the *server* wrote, in English,
   // to a reader who chose Persian. `errors.ts` maps the stable `reason` token each refusal carries
@@ -362,6 +470,28 @@ export const en: Record<string, Message> = {
   'inventory.error_unavailable': 'The server is not answering right now. Try again in a moment.',
   // The last resort, and the only one that keeps the server's own words — under it, as detail. A
   // failure this build has never heard of is one where the server's sentence is the only clue left.
+  // What somebody said happened to an item — lost, retired — and the doors that closes.
+  'inventory.error_asset_archived': 'This item is archived. Restore it before changing what happened to it.',
+  'inventory.error_asset_already_disposed':
+    'This item is already marked lost or retired. Reinstate it first.',
+  'inventory.error_asset_not_disposed': 'This item is in service already; there is nothing to reinstate.',
+  'inventory.error_custody_disposed':
+    'This item is marked lost or retired. Reinstate it before handing it over.',
+  'inventory.error_repair_disposed':
+    'This item is marked lost or retired. Reinstate it before sending it for repair.',
+  // The workspace's own fields. The four naming a field get the field's *name* from the server,
+  // beside the reason, so «Cost centre is required» needs no definitions loaded on this side.
+  'inventory.error_field_key_taken': 'This workspace already has a field with that key.',
+  'inventory.error_field_order_stale':
+    'Somebody else changed the fields while this page was open, so this order was not saved. The list below has been refreshed — arrange it again.',
+  'inventory.error_field_limit_reached':
+    'A workspace can keep {max} custom fields at once, and this one has them all. Archive one it no longer uses to make room.',
+  'inventory.error_field_unknown': 'No field is defined as “{field}” in this workspace. Reload the page.',
+  'inventory.error_field_archived': 'The field “{field}” is archived, so nothing can be written under it.',
+  'inventory.error_field_required': '“{field}” is required.',
+  'inventory.error_field_invalid': '“{field}” does not accept that value.',
+  'inventory.error_field_no_options': 'A choice field needs at least one choice.',
+  'inventory.error_field_options_unused': 'Only a choice field takes a list of choices.',
   'inventory.error_unknown': 'That did not work.',
 }
 
@@ -391,6 +521,37 @@ export const fa: Record<string, Message> = {
   'inventory.status_under_repair': 'در تعمیر',
   'inventory.status_lost': 'مفقود',
   'inventory.status_retired': 'اسقاط‌شده',
+
+  // ---- what somebody said happened to it, and the order of the list -----------------------
+  'inventory.sort': 'مرتب‌سازی',
+  'inventory.sort_recent': 'جدیدترین اول',
+  'inventory.sort_name': 'بر اساس نام',
+  'inventory.sort_code': 'بر اساس کد',
+  'inventory.mark_lost': 'ثبت به‌عنوان مفقود',
+  'inventory.retire': 'اسقاط',
+  'inventory.reinstate': 'بازگرداندن به خدمت',
+  'inventory.lost_since': 'از {date} مفقود است',
+  'inventory.retired_on': 'در {date} اسقاط شد',
+  'inventory.lost_title': '{name} مفقود ثبت شود؟',
+  'inventory.lost_body':
+    'در دفتر اموال ثبت می‌شود که کسی نمی‌داند کجاست. هر کس آن را در اختیار دارد همچنان پاسخ‌گوی آن است، و تا زمانی که به خدمت بازگردانده نشود کسی نمی‌تواند آن را تحویل دهد.',
+  'inventory.retire_title': '{name} اسقاط شود؟',
+  'inventory.retire_body':
+    'شرکت دیگر کاری با آن ندارد — فروخته، اوراق یا از دفاتر خارج شده است. تا زمانی که به خدمت بازگردانده نشود کسی نمی‌تواند آن را تحویل دهد یا برای تعمیر بفرستد، و پس از آن می‌توان بایگانی‌اش کرد.',
+  'inventory.reinstate_title': '{name} به خدمت بازگردانده شود؟',
+  'inventory.reinstate_body':
+    'همان‌طور که بود به خدمت برمی‌گردد — همچنان در اختیار همان کسی که داشت، یا اگر کسی نداشت در انبار.',
+  'inventory.disposition_note': 'یادداشت',
+  'inventory.disposition_note_hint': 'اختیاری — کجا رفت، چه کسی تأیید کرد، بیمه‌گر چه گفت.',
+  'inventory.lost_toast': '{name} مفقود ثبت شد',
+  'inventory.retired_toast': '{name} اسقاط شد',
+  'inventory.reinstated_toast': '{name} به خدمت بازگشت',
+  'inventory.custody_disposed_hint': 'پیش از تحویل، این قلم را به خدمت بازگردانید.',
+  'inventory.repair_disposed_hint': 'پیش از فرستادن برای تعمیر، این قلم را به خدمت بازگردانید.',
+  'inventory.custody_also_holding': {
+    one: '{n} قلم دیگر هم در اختیار اوست',
+    other: '{n} قلم دیگر هم در اختیار اوست',
+  },
   'inventory.currency': 'واحد پول',
   'inventory.price_invalid': 'مبلغی مانند {example} وارد کنید',
   'inventory.count': { one: '{n} قلم', other: '{n} قلم' },
@@ -519,9 +680,13 @@ export const fa: Record<string, Message> = {
   'inventory.history_assigned': '{actor} آن را به {person} تحویل داد',
   'inventory.history_transferred': '{actor} آن را به {person} واگذار کرد',
   'inventory.history_returned': '{actor} آن را از {person} پس گرفت',
-  'inventory.history_retired': '{actor} آن را بایگانی کرد',
+  'inventory.history_archived': '{actor} آن را بایگانی کرد',
   'inventory.history_restored': '{actor} آن را بازگرداند',
+  'inventory.history_lost': '{actor} آن را گم‌شده ثبت کرد',
+  'inventory.history_written_off': '{actor} آن را از رده خارج کرد',
+  'inventory.history_reinstated': '{actor} آن را به خدمت برگرداند',
   'inventory.history_unknown': '{actor} آن را تغییر داد — {action}',
+  'inventory.custom_fields': 'فیلدهای سفارشی',
   'inventory.history_set': '{field} روی {to} تنظیم شد',
   'inventory.history_cleared': '{field} پاک شد',
   'inventory.history_changed': '{field} از {from} به {to} تغییر کرد',
@@ -601,6 +766,61 @@ export const fa: Record<string, Message> = {
   'inventory.stats_unassigned': 'بدون تحویل‌گیرنده',
   'inventory.stats_out_for_repair': 'در تعمیر',
 
+  // ---- custom fields ----------------------------------------------------------------------
+  'inventory.settings_fields': 'فیلدها',
+  'inventory.settings_fields_desc': 'آنچه این فضای کاری دربارهٔ هر قلم، فراتر از مشخصات پیش‌فرض، ثبت می‌کند.',
+  'inventory.fields_error': 'فیلدها بارگذاری نشد',
+  'inventory.fields_empty': 'هنوز فیلدی ساخته نشده است',
+  'inventory.fields_empty_desc':
+    'آنچه مشخصات پیش‌فرض ندارد را بیفزایید — مرکز هزینه، شمارهٔ تأمین‌کننده، نشانی MAC — تا برای همهٔ اقلام یا فقط اقلام یک دسته پرسیده شود.',
+  'inventory.fields_all_archived': 'همهٔ فیلدها بایگانی شده‌اند',
+  'inventory.fields_all_archived_desc':
+    'بایگانی‌شده‌ها را نشان بدهید تا یکی را بازگردانید، یا فیلد تازه‌ای بسازید.',
+  'inventory.field_new': 'فیلد جدید',
+  'inventory.field_edit': 'ویرایش فیلد',
+  'inventory.field_key': 'کلید',
+  'inventory.field_key_hint':
+    'حروف کوچک لاتین، رقم و زیرخط، با آغاز از یک حرف — cost_centre. مقدارها زیر همین کلید ذخیره می‌شوند، بنابراین پس از ساخت فیلد قابل تغییر نیست.',
+  'inventory.field_key_invalid': 'از حروف کوچک لاتین، رقم و زیرخط استفاده کنید و با یک حرف آغاز کنید',
+  'inventory.field_name': 'نام',
+  'inventory.field_name_placeholder': 'مرکز هزینه، شمارهٔ تأمین‌کننده، نشانی MAC…',
+  'inventory.field_description': 'توضیح',
+  'inventory.field_description_hint': 'زیر فیلد در فرم قلم نمایش داده می‌شود.',
+  'inventory.field_type': 'نوع',
+  'inventory.field_type_hint': 'پس از ساخت فیلد قابل تغییر نیست.',
+  'inventory.field_type_text': 'متن',
+  'inventory.field_type_number': 'عدد',
+  'inventory.field_type_date': 'تاریخ',
+  'inventory.field_type_select': 'یک گزینه',
+  'inventory.field_type_multiselect': 'چند گزینه',
+  'inventory.field_type_checkbox': 'بله یا خیر',
+  'inventory.field_type_url': 'پیوند',
+  'inventory.field_scope': 'پرسیده می‌شود برای',
+  'inventory.field_scope_all': 'همهٔ اقلام',
+  'inventory.field_required': 'الزامی',
+  'inventory.field_required_desc': 'قلم بدون مقدار این فیلد ذخیره نمی‌شود.',
+  'inventory.field_options': 'گزینه‌ها',
+  'inventory.field_options_hint': 'هر گزینه در یک خط، به ترتیبی که پیشنهاد می‌شود.',
+  'inventory.field_options_rename_note':
+    'تغییر نام یا حذف یک گزینه، مقدارهایی را که پیش‌تر ثبت شده‌اند همان‌طور که بودند نگه می‌دارد.',
+  'inventory.field_reorder_hint':
+    'برای تغییر ترتیب نمایش در فرم قلم، فیلد را بکشید یا از پیکان‌های همان ردیف استفاده کنید.',
+  'inventory.field_move_up': 'انتقال {name} به بالا',
+  'inventory.field_move_down': 'انتقال {name} به پایین',
+  'inventory.field_position_first': '{name} در ابتدای فهرست است',
+  'inventory.field_position_last': '{name} در انتهای فهرست است',
+  'inventory.field_position_after': '{name} پس از {other} است',
+  'inventory.field_created_toast': '{name} افزوده شد',
+  'inventory.field_updated_toast': '{name} ذخیره شد',
+  'inventory.field_archived_toast': '{name} بایگانی شد',
+  'inventory.field_restored_toast': '{name} بازگردانده شد',
+  'inventory.field_archive_title': '{name} بایگانی شود؟',
+  'inventory.field_archive_body':
+    'از فرم قلم و پنل جزئیات کنار می‌رود. مقدارهایی که پیش‌تر زیر آن ثبت شده‌اند نگه داشته می‌شوند و خواندنی می‌مانند، و هر زمان می‌توانید فیلد را بازگردانید.',
+  'inventory.custom_missing_required': 'هنوز باید پر شود: {field}',
+  'inventory.yes': 'بله',
+  'inventory.no': 'خیر',
+
   // «بارگذاری مجدد» is what the shell calls Reload (`pwa_update_reload`), so these use its verb.
   'inventory.error_custody_conflict':
     'کسی درست پیش از شما تغییر داد که این قلم در اختیار چه کسی است. صفحه را دوباره بارگذاری کنید تا ببینید اکنون کجاست.',
@@ -635,6 +855,26 @@ export const fa: Record<string, Message> = {
   'inventory.error_unauthorized': 'نشست شما پایان یافته است. دوباره وارد شوید.',
   'inventory.error_rate_limited': 'درخواست‌ها بیش از اندازه است. کمی صبر کنید و باز تلاش کنید.',
   'inventory.error_unavailable': 'سرور همین حالا پاسخ نمی‌دهد. کمی بعد باز تلاش کنید.',
+  'inventory.error_asset_archived': 'این قلم بایگانی شده است. پیش از تغییر وضعیت آن، بازگردانی‌اش کنید.',
+  'inventory.error_asset_already_disposed':
+    'این قلم قبلاً گم‌شده یا از رده خارج ثبت شده است. ابتدا آن را به خدمت برگردانید.',
+  'inventory.error_asset_not_disposed': 'این قلم هم‌اکنون در خدمت است؛ چیزی برای برگرداندن نیست.',
+  'inventory.error_custody_disposed':
+    'این قلم گم‌شده یا از رده خارج ثبت شده است. پیش از تحویل، آن را به خدمت برگردانید.',
+  'inventory.error_repair_disposed':
+    'این قلم گم‌شده یا از رده خارج ثبت شده است. پیش از ارسال برای تعمیر، آن را به خدمت برگردانید.',
+  'inventory.error_field_key_taken': 'این فضای کاری از قبل فیلدی با این کلید دارد.',
+  'inventory.error_field_order_stale':
+    'کس دیگری در حین باز بودن این صفحه فیلدها را تغییر داد، بنابراین این ترتیب ذخیره نشد. فهرست زیر تازه شده است — دوباره مرتبش کنید.',
+  'inventory.error_field_limit_reached':
+    'هر فضای کاری می‌تواند هم‌زمان {max} فیلد سفارشی داشته باشد و این فضا همه را دارد. برای باز شدن جا، یکی را که دیگر استفاده نمی‌شود بایگانی کنید.',
+  'inventory.error_field_unknown':
+    'فیلدی با نام «{field}» در این فضای کاری تعریف نشده است. صفحه را دوباره بارگذاری کنید.',
+  'inventory.error_field_archived': 'فیلد «{field}» بایگانی شده است، بنابراین نمی‌توان مقداری در آن نوشت.',
+  'inventory.error_field_required': '«{field}» الزامی است.',
+  'inventory.error_field_invalid': '«{field}» این مقدار را نمی‌پذیرد.',
+  'inventory.error_field_no_options': 'یک فیلد انتخابی دست‌کم به یک گزینه نیاز دارد.',
+  'inventory.error_field_options_unused': 'فقط فیلد انتخابی فهرست گزینه‌ها می‌پذیرد.',
   'inventory.error_unknown': 'این کار انجام نشد.',
 }
 
@@ -664,6 +904,41 @@ export const ar: Record<string, Message> = {
   'inventory.status_under_repair': 'قيد الإصلاح',
   'inventory.status_lost': 'مفقود',
   'inventory.status_retired': 'مستبعد',
+
+  // ---- what somebody said happened to it, and the order of the list -----------------------
+  'inventory.sort': 'الترتيب',
+  'inventory.sort_recent': 'الأحدث أولًا',
+  'inventory.sort_name': 'حسب الاسم',
+  'inventory.sort_code': 'حسب الرمز',
+  'inventory.mark_lost': 'تسجيل كمفقود',
+  'inventory.retire': 'استبعاد',
+  'inventory.reinstate': 'إعادة إلى الخدمة',
+  'inventory.lost_since': 'مفقود منذ {date}',
+  'inventory.retired_on': 'استُبعد في {date}',
+  'inventory.lost_title': 'تسجيل {name} كمفقود؟',
+  'inventory.lost_body':
+    'سيسجّل السجل أن لا أحد يعرف مكانه. يبقى من بحوزته مسؤولًا عنه، ولن يتمكن أحد من تسليمه حتى يُعاد إلى الخدمة.',
+  'inventory.retire_title': 'استبعاد {name}؟',
+  'inventory.retire_body':
+    'انتهت الشركة منه — بيع أو أُتلف أو شُطب. لن يتمكن أحد من تسليمه أو إرساله للإصلاح حتى يُعاد إلى الخدمة، ويمكن بعدها أرشفته.',
+  'inventory.reinstate_title': 'إعادة {name} إلى الخدمة؟',
+  'inventory.reinstate_body':
+    'يعود إلى الخدمة كما كان — بحوزة من كان يحمله، أو في المخزن إن لم يكن بحوزة أحد.',
+  'inventory.disposition_note': 'ملاحظة',
+  'inventory.disposition_note_hint': 'اختياري — أين ذهب، من اعتمد ذلك، ماذا قالت شركة التأمين.',
+  'inventory.lost_toast': 'سُجّل {name} كمفقود',
+  'inventory.retired_toast': 'استُبعد {name}',
+  'inventory.reinstated_toast': 'أُعيد {name} إلى الخدمة',
+  'inventory.custody_disposed_hint': 'أعد هذا الأصل إلى الخدمة قبل تسليمه.',
+  'inventory.repair_disposed_hint': 'أعد هذا الأصل إلى الخدمة قبل إرساله للإصلاح.',
+  'inventory.custody_also_holding': {
+    zero: 'لا شيء آخر بحوزته',
+    one: 'بحوزته أيضًا أصل واحد آخر',
+    two: 'بحوزته أيضًا أصلان آخران',
+    few: 'بحوزته أيضًا {n} أصول أخرى',
+    many: 'بحوزته أيضًا {n} أصلاً آخر',
+    other: 'بحوزته أيضًا {n} أصل آخر',
+  },
   'inventory.currency': 'العملة',
   'inventory.price_invalid': 'أدخل مبلغًا مثل {example}',
   'inventory.count': {
@@ -793,9 +1068,13 @@ export const ar: Record<string, Message> = {
   'inventory.history_assigned': 'سلّمه {actor} إلى {person}',
   'inventory.history_transferred': 'نقله {actor} إلى {person}',
   'inventory.history_returned': 'استرجعه {actor} من {person}',
-  'inventory.history_retired': 'أرشفه {actor}',
+  'inventory.history_archived': 'أرشفه {actor}',
   'inventory.history_restored': 'استعاده {actor}',
+  'inventory.history_lost': 'سجّله {actor} مفقودًا',
+  'inventory.history_written_off': 'أخرجه {actor} من الخدمة',
+  'inventory.history_reinstated': 'أعاده {actor} إلى الخدمة',
   'inventory.history_unknown': 'غيّره {actor} — {action}',
+  'inventory.custom_fields': 'حقول مخصصة',
   'inventory.history_set': 'ضُبط {field} على {to}',
   'inventory.history_cleared': 'مُسح {field}',
   'inventory.history_changed': 'تغيّر {field} من {from} إلى {to}',
@@ -881,6 +1160,58 @@ export const ar: Record<string, Message> = {
   'inventory.stats_unassigned': 'ليست في عهدة أحد',
   'inventory.stats_out_for_repair': 'خارج للإصلاح',
 
+  // ---- custom fields ----------------------------------------------------------------------
+  'inventory.settings_fields': 'الحقول',
+  'inventory.settings_fields_desc': 'ما تسجّله مساحة العمل هذه عن الأصل زيادةً على التفاصيل المضمّنة.',
+  'inventory.fields_error': 'تعذّر تحميل الحقول',
+  'inventory.fields_empty': 'لا حقول بعد',
+  'inventory.fields_empty_desc':
+    'أضف ما تغفله التفاصيل المضمّنة — مركز تكلفة، مرجع مورّد، عنوان MAC — فيُطلب على كل أصل، أو على أصول فئة واحدة فقط.',
+  'inventory.fields_all_archived': 'كل الحقول مؤرشفة',
+  'inventory.fields_all_archived_desc': 'أظهر المؤرشفة لتستعيد أحدها، أو أضف حقلًا جديدًا.',
+  'inventory.field_new': 'حقل جديد',
+  'inventory.field_edit': 'تعديل الحقل',
+  'inventory.field_key': 'المفتاح',
+  'inventory.field_key_hint':
+    'أحرف لاتينية صغيرة وأرقام وشرطات سفلية، تبدأ بحرف — cost_centre. تُخزَّن القيم تحته، فلا يمكن تغييره بعد إنشاء الحقل.',
+  'inventory.field_key_invalid': 'استخدم أحرفًا لاتينية صغيرة وأرقامًا وشرطات سفلية، وابدأ بحرف',
+  'inventory.field_name': 'الاسم',
+  'inventory.field_name_placeholder': 'مركز التكلفة، مرجع المورّد، عنوان MAC…',
+  'inventory.field_description': 'الوصف',
+  'inventory.field_description_hint': 'يظهر تحت الحقل في نموذج الأصل.',
+  'inventory.field_type': 'النوع',
+  'inventory.field_type_hint': 'لا يمكن تغييره بعد إنشاء الحقل.',
+  'inventory.field_type_text': 'نص',
+  'inventory.field_type_number': 'رقم',
+  'inventory.field_type_date': 'تاريخ',
+  'inventory.field_type_select': 'خيار واحد',
+  'inventory.field_type_multiselect': 'عدة خيارات',
+  'inventory.field_type_checkbox': 'نعم أو لا',
+  'inventory.field_type_url': 'رابط',
+  'inventory.field_scope': 'يُطلب على',
+  'inventory.field_scope_all': 'كل الأصول',
+  'inventory.field_required': 'إلزامي',
+  'inventory.field_required_desc': 'لا يُحفظ الأصل دون قيمة لهذا الحقل.',
+  'inventory.field_options': 'الخيارات',
+  'inventory.field_options_hint': 'خيار واحد في كل سطر، بالترتيب الذي تُعرض به.',
+  'inventory.field_options_rename_note': 'إعادة تسمية خيار أو حذفه تترك القيم المسجّلة من قبل كما كانت.',
+  'inventory.field_reorder_hint': 'اسحب حقلًا أو استخدم السهمين في صفّه لتغيير ترتيب ظهوره في نموذج الأصل.',
+  'inventory.field_move_up': 'نقل {name} إلى الأعلى',
+  'inventory.field_move_down': 'نقل {name} إلى الأسفل',
+  'inventory.field_position_first': '{name} في أول القائمة',
+  'inventory.field_position_last': '{name} في آخر القائمة',
+  'inventory.field_position_after': '{name} بعد {other}',
+  'inventory.field_created_toast': 'تمت إضافة {name}',
+  'inventory.field_updated_toast': 'تم حفظ {name}',
+  'inventory.field_archived_toast': 'تمت أرشفة {name}',
+  'inventory.field_restored_toast': 'تمت استعادة {name}',
+  'inventory.field_archive_title': 'أرشفة {name}؟',
+  'inventory.field_archive_body':
+    'يختفي من نموذج الأصل ومن لوحة التفاصيل. القيم المسجّلة تحته من قبل تبقى محفوظة ومقروءة، ويمكنك استعادة الحقل في أي وقت.',
+  'inventory.custom_missing_required': 'ما زال يلزم تعبئة: {field}',
+  'inventory.yes': 'نعم',
+  'inventory.no': 'لا',
+
   // «إعادة التحميل» is what the shell calls Reload (`pwa_update_reload`), so these use its verb.
   'inventory.error_custody_conflict':
     'غيّر أحدهم من يحمل هذا الأصل قبلك بلحظة. أعد تحميل الصفحة لترى أين هو الآن.',
@@ -907,6 +1238,24 @@ export const ar: Record<string, Message> = {
   'inventory.error_unauthorized': 'انتهت جلستك. سجّل الدخول من جديد.',
   'inventory.error_rate_limited': 'طلبات كثيرة في وقت قصير. انتظر قليلًا ثم أعد المحاولة.',
   'inventory.error_unavailable': 'الخادم لا يستجيب الآن. أعد المحاولة بعد قليل.',
+  'inventory.error_asset_archived': 'هذا العنصر مؤرشف. استعده قبل تغيير ما حدث له.',
+  'inventory.error_asset_already_disposed':
+    'هذا العنصر مسجّل بالفعل مفقودًا أو خارج الخدمة. أعده إلى الخدمة أولًا.',
+  'inventory.error_asset_not_disposed': 'هذا العنصر في الخدمة بالفعل؛ لا شيء لإعادته.',
+  'inventory.error_custody_disposed': 'هذا العنصر مسجّل مفقودًا أو خارج الخدمة. أعده إلى الخدمة قبل تسليمه.',
+  'inventory.error_repair_disposed':
+    'هذا العنصر مسجّل مفقودًا أو خارج الخدمة. أعده إلى الخدمة قبل إرساله للإصلاح.',
+  'inventory.error_field_key_taken': 'يوجد في مساحة العمل هذه حقل بهذا المفتاح بالفعل.',
+  'inventory.error_field_order_stale':
+    'غيّر شخص آخر الحقول أثناء فتح هذه الصفحة، فلم يُحفظ هذا الترتيب. حُدّثت القائمة أدناه — رتّبها من جديد.',
+  'inventory.error_field_limit_reached':
+    'يمكن لمساحة العمل الاحتفاظ بـ {max} حقلًا مخصصًا في آنٍ واحد، وهذه المساحة تملكها كلها. أرشف حقلًا لم تعد تستخدمه لإفساح المجال.',
+  'inventory.error_field_unknown': 'لا يوجد حقل معرّف باسم «{field}» في مساحة العمل هذه. أعد تحميل الصفحة.',
+  'inventory.error_field_archived': 'الحقل «{field}» مؤرشف، فلا يمكن كتابة شيء فيه.',
+  'inventory.error_field_required': '«{field}» مطلوب.',
+  'inventory.error_field_invalid': '«{field}» لا يقبل هذه القيمة.',
+  'inventory.error_field_no_options': 'يحتاج حقل الاختيار إلى خيار واحد على الأقل.',
+  'inventory.error_field_options_unused': 'حقل الاختيار وحده يقبل قائمة خيارات.',
   'inventory.error_unknown': 'لم ينجح ذلك.',
 }
 
@@ -935,6 +1284,39 @@ export const de: Record<string, Message> = {
   'inventory.status_under_repair': 'In Reparatur',
   'inventory.status_lost': 'Verloren',
   'inventory.status_retired': 'Ausgemustert',
+
+  // ---- what somebody said happened to it, and the order of the list -----------------------
+  'inventory.sort': 'Sortierung',
+  'inventory.sort_recent': 'Neueste zuerst',
+  'inventory.sort_name': 'Nach Name',
+  'inventory.sort_code': 'Nach Inventarnummer',
+  'inventory.mark_lost': 'Als verloren melden',
+  'inventory.retire': 'Ausmustern',
+  'inventory.reinstate': 'Wieder in Betrieb nehmen',
+  'inventory.lost_since': 'Verloren seit {date}',
+  'inventory.retired_on': 'Ausgemustert am {date}',
+  'inventory.lost_title': '{name} als verloren melden?',
+  'inventory.lost_body':
+    'Das Verzeichnis hält fest, dass niemand weiß, wo der Gegenstand ist. Wer ihn hat, bleibt dafür verantwortlich, und niemand kann ihn ausgeben, bis er wieder in Betrieb genommen wird.',
+  'inventory.retire_title': '{name} ausmustern?',
+  'inventory.retire_body':
+    'Das Unternehmen braucht ihn nicht mehr — verkauft, verschrottet oder abgeschrieben. Niemand kann ihn ausgeben oder zur Reparatur schicken, bis er wieder in Betrieb genommen wird; danach lässt er sich archivieren.',
+  'inventory.reinstate_title': '{name} wieder in Betrieb nehmen?',
+  'inventory.reinstate_body':
+    'Er kommt so zurück, wie er war — bei der Person, die ihn hatte, oder auf Lager, wenn niemand ihn hatte.',
+  'inventory.disposition_note': 'Notiz',
+  'inventory.disposition_note_hint':
+    'Optional — wohin er gegangen ist, wer es freigegeben hat, was die Versicherung gesagt hat.',
+  'inventory.lost_toast': '{name} als verloren gemeldet',
+  'inventory.retired_toast': '{name} ausgemustert',
+  'inventory.reinstated_toast': '{name} wieder in Betrieb',
+  'inventory.custody_disposed_hint': 'Nehmen Sie den Gegenstand wieder in Betrieb, bevor Sie ihn ausgeben.',
+  'inventory.repair_disposed_hint':
+    'Nehmen Sie den Gegenstand wieder in Betrieb, bevor Sie ihn zur Reparatur schicken.',
+  'inventory.custody_also_holding': {
+    one: 'Hat außerdem {n} weiteren Gegenstand',
+    other: 'Hat außerdem {n} weitere Gegenstände',
+  },
   'inventory.currency': 'Währung',
   'inventory.price_invalid': 'Betrag wie {example} eingeben',
   'inventory.count': { one: '{n} Gegenstand', other: '{n} Gegenstände' },
@@ -1067,9 +1449,13 @@ export const de: Record<string, Message> = {
   'inventory.history_assigned': '{actor} hat ihn an {person} ausgegeben',
   'inventory.history_transferred': '{actor} hat ihn an {person} weitergegeben',
   'inventory.history_returned': '{actor} hat ihn von {person} zurückgenommen',
-  'inventory.history_retired': '{actor} hat ihn archiviert',
+  'inventory.history_archived': '{actor} hat ihn archiviert',
   'inventory.history_restored': '{actor} hat ihn wiederhergestellt',
+  'inventory.history_lost': '{actor} hat ihn als verloren gemeldet',
+  'inventory.history_written_off': '{actor} hat ihn ausgemustert',
+  'inventory.history_reinstated': '{actor} hat ihn wieder in Betrieb genommen',
   'inventory.history_unknown': '{actor} hat ihn geändert — {action}',
+  'inventory.custom_fields': 'Eigene Felder',
   'inventory.history_set': '{field} auf {to} gesetzt',
   'inventory.history_cleared': '{field} geleert',
   'inventory.history_changed': '{field} von {from} auf {to} geändert',
@@ -1153,6 +1539,63 @@ export const de: Record<string, Message> = {
   'inventory.stats_unassigned': 'Niemandem zugeordnet',
   'inventory.stats_out_for_repair': 'In Reparatur',
 
+  // ---- custom fields ----------------------------------------------------------------------
+  'inventory.settings_fields': 'Felder',
+  'inventory.settings_fields_desc':
+    'Was dieser Workspace über einen Gegenstand festhält, über die eingebauten Angaben hinaus.',
+  'inventory.fields_error': 'Die Felder konnten nicht geladen werden',
+  'inventory.fields_empty': 'Noch keine Felder',
+  'inventory.fields_empty_desc':
+    'Ergänzen Sie, was die eingebauten Angaben auslassen — eine Kostenstelle, eine Lieferantennummer, eine MAC-Adresse — und es wird bei jedem Gegenstand abgefragt, oder nur bei denen einer Kategorie.',
+  'inventory.fields_all_archived': 'Alle Felder sind archiviert',
+  'inventory.fields_all_archived_desc':
+    'Zeigen Sie die archivierten an, um eines wiederherzustellen, oder legen Sie ein neues an.',
+  'inventory.field_new': 'Neues Feld',
+  'inventory.field_edit': 'Feld bearbeiten',
+  'inventory.field_key': 'Schlüssel',
+  'inventory.field_key_hint':
+    'Kleinbuchstaben, Ziffern und Unterstriche, beginnend mit einem Buchstaben — cost_centre. Werte werden darunter gespeichert, daher lässt er sich nach dem Anlegen nicht mehr ändern.',
+  'inventory.field_key_invalid':
+    'Verwenden Sie Kleinbuchstaben, Ziffern und Unterstriche, beginnend mit einem Buchstaben',
+  'inventory.field_name': 'Name',
+  'inventory.field_name_placeholder': 'Kostenstelle, Lieferantennummer, MAC-Adresse…',
+  'inventory.field_description': 'Beschreibung',
+  'inventory.field_description_hint': 'Wird im Formular unter dem Feld angezeigt.',
+  'inventory.field_type': 'Typ',
+  'inventory.field_type_hint': 'Lässt sich nach dem Anlegen nicht mehr ändern.',
+  'inventory.field_type_text': 'Text',
+  'inventory.field_type_number': 'Zahl',
+  'inventory.field_type_date': 'Datum',
+  'inventory.field_type_select': 'Eine Auswahl',
+  'inventory.field_type_multiselect': 'Mehrere Auswahlen',
+  'inventory.field_type_checkbox': 'Ja oder nein',
+  'inventory.field_type_url': 'Link',
+  'inventory.field_scope': 'Abgefragt bei',
+  'inventory.field_scope_all': 'Jedem Gegenstand',
+  'inventory.field_required': 'Pflichtfeld',
+  'inventory.field_required_desc': 'Ein Gegenstand lässt sich ohne Wert nicht speichern.',
+  'inventory.field_options': 'Auswahlmöglichkeiten',
+  'inventory.field_options_hint': 'Eine pro Zeile, in der Reihenfolge, in der sie angeboten werden.',
+  'inventory.field_options_rename_note':
+    'Wird eine Auswahl umbenannt oder entfernt, bleiben bereits erfasste Werte, wie sie waren.',
+  'inventory.field_reorder_hint':
+    'Ziehen Sie ein Feld oder nutzen Sie die Pfeile in seiner Zeile, um die Reihenfolge im Formular zu ändern.',
+  'inventory.field_move_up': '{name} nach oben schieben',
+  'inventory.field_move_down': '{name} nach unten schieben',
+  'inventory.field_position_first': '{name} steht an erster Stelle',
+  'inventory.field_position_last': '{name} steht an letzter Stelle',
+  'inventory.field_position_after': '{name} steht hinter {other}',
+  'inventory.field_created_toast': '{name} hinzugefügt',
+  'inventory.field_updated_toast': '{name} gespeichert',
+  'inventory.field_archived_toast': '{name} archiviert',
+  'inventory.field_restored_toast': '{name} wiederhergestellt',
+  'inventory.field_archive_title': '{name} archivieren?',
+  'inventory.field_archive_body':
+    'Es verschwindet aus dem Formular und aus den Details. Bereits erfasste Werte bleiben erhalten und lesbar; Sie können das Feld jederzeit wiederherstellen.',
+  'inventory.custom_missing_required': 'Noch auszufüllen: {field}',
+  'inventory.yes': 'Ja',
+  'inventory.no': 'Nein',
+
   // "Neu laden" is what the shell calls Reload (`pwa_update_reload`), so these use its verb.
   'inventory.error_custody_conflict':
     'Kurz vor Ihnen hat jemand geändert, wer den Gegenstand hat. Laden Sie die Seite neu, um zu sehen, wo er jetzt ist.',
@@ -1191,6 +1634,29 @@ export const de: Record<string, Message> = {
   'inventory.error_rate_limited':
     'Gerade zu viele Anfragen. Warten Sie einen Moment und versuchen Sie es erneut.',
   'inventory.error_unavailable': 'Der Server antwortet gerade nicht. Versuchen Sie es gleich noch einmal.',
+  'inventory.error_asset_archived':
+    'Dieser Gegenstand ist archiviert. Stellen Sie ihn wieder her, bevor Sie ändern, was mit ihm geschehen ist.',
+  'inventory.error_asset_already_disposed':
+    'Dieser Gegenstand ist bereits als verloren gemeldet oder ausgemustert. Nehmen Sie ihn zuerst wieder in Betrieb.',
+  'inventory.error_asset_not_disposed':
+    'Dieser Gegenstand ist bereits in Betrieb; es gibt nichts wieder in Betrieb zu nehmen.',
+  'inventory.error_custody_disposed':
+    'Dieser Gegenstand ist als verloren gemeldet oder ausgemustert. Nehmen Sie ihn wieder in Betrieb, bevor Sie ihn übergeben.',
+  'inventory.error_repair_disposed':
+    'Dieser Gegenstand ist als verloren gemeldet oder ausgemustert. Nehmen Sie ihn wieder in Betrieb, bevor Sie ihn zur Reparatur schicken.',
+  'inventory.error_field_key_taken': 'In diesem Workspace gibt es bereits ein Feld mit diesem Schlüssel.',
+  'inventory.error_field_order_stale':
+    'Jemand anderes hat die Felder geändert, während diese Seite offen war — diese Reihenfolge wurde nicht gespeichert. Die Liste unten ist wieder aktuell; ordnen Sie sie erneut.',
+  'inventory.error_field_limit_reached':
+    'Ein Workspace kann {max} eigene Felder gleichzeitig führen, und dieser hat sie alle. Archivieren Sie eines, das nicht mehr gebraucht wird, um Platz zu schaffen.',
+  'inventory.error_field_unknown':
+    'In diesem Workspace ist kein Feld „{field}“ definiert. Laden Sie die Seite neu.',
+  'inventory.error_field_archived':
+    'Das Feld „{field}“ ist archiviert, daher kann nichts darin gespeichert werden.',
+  'inventory.error_field_required': '„{field}“ ist ein Pflichtfeld.',
+  'inventory.error_field_invalid': '„{field}“ nimmt diesen Wert nicht an.',
+  'inventory.error_field_no_options': 'Ein Auswahlfeld braucht mindestens eine Option.',
+  'inventory.error_field_options_unused': 'Nur ein Auswahlfeld nimmt eine Liste von Optionen an.',
   'inventory.error_unknown': 'Das hat nicht funktioniert.',
 }
 
@@ -1222,6 +1688,38 @@ export const tr: Record<string, Message> = {
   // Adjectival, like every other badge in this set (Depoda, Zimmetli, Onarımda, Kayıp). "Hurdaya
   // ayrıldı" is a finished sentence, and a table cell reporting a state does not narrate an event.
   'inventory.status_retired': 'Hurdaya ayrılmış',
+
+  // ---- what somebody said happened to it, and the order of the list -----------------------
+  'inventory.sort': 'Sıralama',
+  'inventory.sort_recent': 'Önce en yeni',
+  'inventory.sort_name': 'Ada göre',
+  'inventory.sort_code': 'Numaraya göre',
+  'inventory.mark_lost': 'Kayıp olarak işaretle',
+  'inventory.retire': 'Hurdaya ayır',
+  'inventory.reinstate': 'Yeniden hizmete al',
+  'inventory.lost_since': '{date} tarihinden beri kayıp',
+  'inventory.retired_on': '{date} tarihinde hurdaya ayrıldı',
+  'inventory.lost_title': '{name} kayıp olarak işaretlensin mi?',
+  'inventory.lost_body':
+    'Kayıt, nerede olduğunu kimsenin bilmediğini gösterir. Zimmetinde olan kişi sorumlu kalır ve yeniden hizmete alınana kadar kimse onu zimmetleyemez.',
+  'inventory.retire_title': '{name} hurdaya ayrılsın mı?',
+  'inventory.retire_body':
+    'Şirketin onunla işi bitti — satıldı, hurdaya çıktı ya da kayıtlardan düşüldü. Yeniden hizmete alınana kadar kimse onu zimmetleyemez ya da onarıma gönderemez; sonrasında arşivlenebilir.',
+  'inventory.reinstate_title': '{name} yeniden hizmete alınsın mı?',
+  'inventory.reinstate_body':
+    'Olduğu gibi hizmete döner — zimmetinde olan kişide kalır, kimsede değilse depoya döner.',
+  'inventory.disposition_note': 'Not',
+  'inventory.disposition_note_hint':
+    'İsteğe bağlı — nereye gittiği, kimin onayladığı, sigortacının ne dediği.',
+  'inventory.lost_toast': '{name} kayıp olarak işaretlendi',
+  'inventory.retired_toast': '{name} hurdaya ayrıldı',
+  'inventory.reinstated_toast': '{name} yeniden hizmete alındı',
+  'inventory.custody_disposed_hint': 'Zimmetlemeden önce bu demirbaşı yeniden hizmete alın.',
+  'inventory.repair_disposed_hint': 'Onarıma göndermeden önce bu demirbaşı yeniden hizmete alın.',
+  'inventory.custody_also_holding': {
+    one: 'Ayrıca {n} demirbaş daha zimmetinde',
+    other: 'Ayrıca {n} demirbaş daha zimmetinde',
+  },
   'inventory.currency': 'Para birimi',
   'inventory.price_invalid': '{example} gibi bir tutar girin',
   'inventory.count': { one: '{n} demirbaş', other: '{n} demirbaş' },
@@ -1354,9 +1852,13 @@ export const tr: Record<string, Message> = {
   'inventory.history_assigned': '{actor}, {person} kişisine zimmetledi',
   'inventory.history_transferred': '{actor}, {person} kişisine devretti',
   'inventory.history_returned': '{actor}, {person} kişisinden teslim aldı',
-  'inventory.history_retired': '{actor} arşivledi',
+  'inventory.history_archived': '{actor} arşivledi',
   'inventory.history_restored': '{actor} geri getirdi',
+  'inventory.history_lost': '{actor} kayıp olarak işaretledi',
+  'inventory.history_written_off': '{actor} hizmetten çıkardı',
+  'inventory.history_reinstated': '{actor} yeniden hizmete aldı',
   'inventory.history_unknown': '{actor} değiştirdi — {action}',
+  'inventory.custom_fields': 'Özel alanlar',
   'inventory.history_set': '{field} {to} olarak ayarlandı',
   'inventory.history_cleared': '{field} temizlendi',
   'inventory.history_changed': '{field} {from} değerinden {to} değerine değişti',
@@ -1440,6 +1942,62 @@ export const tr: Record<string, Message> = {
   'inventory.stats_unassigned': 'Kimsede değil',
   'inventory.stats_out_for_repair': 'Onarımda',
 
+  // ---- custom fields ----------------------------------------------------------------------
+  'inventory.settings_fields': 'Alanlar',
+  'inventory.settings_fields_desc':
+    'Bu çalışma alanının bir demirbaş hakkında yerleşik bilgilerin ötesinde neleri kaydettiği.',
+  'inventory.fields_error': 'Alanlar yüklenemedi',
+  'inventory.fields_empty': 'Henüz alan yok',
+  'inventory.fields_empty_desc':
+    'Yerleşik bilgilerin dışında kalanları ekleyin — masraf merkezi, tedarikçi numarası, MAC adresi — ve her demirbaşta ya da yalnızca bir kategoridekilerde sorulsun.',
+  'inventory.fields_all_archived': 'Bütün alanlar arşivlenmiş',
+  'inventory.fields_all_archived_desc':
+    'Birini geri getirmek için arşivlenmişleri gösterin ya da yeni bir alan ekleyin.',
+  'inventory.field_new': 'Yeni alan',
+  'inventory.field_edit': 'Alanı düzenle',
+  'inventory.field_key': 'Anahtar',
+  'inventory.field_key_hint':
+    'Küçük Latin harfleri, rakamlar ve alt çizgi; bir harfle başlar — cost_centre. Değerler bu anahtar altında saklanır, bu yüzden alan oluşturulduktan sonra değiştirilemez.',
+  'inventory.field_key_invalid': 'Küçük Latin harfleri, rakamlar ve alt çizgi kullanın; bir harfle başlayın',
+  'inventory.field_name': 'Ad',
+  'inventory.field_name_placeholder': 'Masraf merkezi, Tedarikçi numarası, MAC adresi…',
+  'inventory.field_description': 'Açıklama',
+  'inventory.field_description_hint': 'Demirbaş formunda alanın altında gösterilir.',
+  'inventory.field_type': 'Tür',
+  'inventory.field_type_hint': 'Alan oluşturulduktan sonra değiştirilemez.',
+  'inventory.field_type_text': 'Metin',
+  'inventory.field_type_number': 'Sayı',
+  'inventory.field_type_date': 'Tarih',
+  'inventory.field_type_select': 'Tek seçim',
+  'inventory.field_type_multiselect': 'Çoklu seçim',
+  'inventory.field_type_checkbox': 'Evet ya da hayır',
+  'inventory.field_type_url': 'Bağlantı',
+  'inventory.field_scope': 'Sorulduğu yer',
+  'inventory.field_scope_all': 'Her demirbaş',
+  'inventory.field_required': 'Zorunlu',
+  'inventory.field_required_desc': 'Bu alan boşken demirbaş kaydedilemez.',
+  'inventory.field_options': 'Seçenekler',
+  'inventory.field_options_hint': 'Her satıra bir seçenek, sunulacakları sırayla.',
+  'inventory.field_options_rename_note':
+    'Bir seçeneği yeniden adlandırmak ya da kaldırmak, daha önce kaydedilmiş değerleri olduğu gibi bırakır.',
+  'inventory.field_reorder_hint':
+    'Demirbaş formundaki sırayı değiştirmek için bir alanı sürükleyin ya da satırındaki okları kullanın.',
+  'inventory.field_move_up': '{name} alanını yukarı taşı',
+  'inventory.field_move_down': '{name} alanını aşağı taşı',
+  'inventory.field_position_first': '{name} ilk sırada',
+  'inventory.field_position_last': '{name} son sırada',
+  'inventory.field_position_after': '{name}, {other} alanından sonra',
+  'inventory.field_created_toast': '{name} eklendi',
+  'inventory.field_updated_toast': '{name} kaydedildi',
+  'inventory.field_archived_toast': '{name} arşivlendi',
+  'inventory.field_restored_toast': '{name} geri getirildi',
+  'inventory.field_archive_title': '{name} arşivlensin mi?',
+  'inventory.field_archive_body':
+    'Demirbaş formundan ve ayrıntı panelinden çıkar. Altında daha önce kaydedilmiş değerler korunur ve okunabilir kalır; alanı istediğiniz zaman geri getirebilirsiniz.',
+  'inventory.custom_missing_required': 'Hâlâ doldurulması gereken: {field}',
+  'inventory.yes': 'Evet',
+  'inventory.no': 'Hayır',
+
   // "Yeniden yükle" is what the shell calls Reload (`pwa_update_reload`), so these use its verb.
   'inventory.error_custody_conflict':
     'Bu demirbaşın kimde olduğunu sizden hemen önce başkası değiştirdi. Şimdi nerede olduğunu görmek için sayfayı yeniden yükleyin.',
@@ -1471,6 +2029,26 @@ export const tr: Record<string, Message> = {
   'inventory.error_unauthorized': 'Oturumunuz sona erdi. Yeniden giriş yapın.',
   'inventory.error_rate_limited': 'Şu an çok fazla istek var. Biraz bekleyip tekrar deneyin.',
   'inventory.error_unavailable': 'Sunucu şu anda yanıt vermiyor. Birazdan tekrar deneyin.',
+  'inventory.error_asset_archived': 'Bu öğe arşivlenmiş. Başına gelenleri değiştirmeden önce geri getirin.',
+  'inventory.error_asset_already_disposed':
+    'Bu öğe zaten kayıp ya da hizmetten çıkarılmış olarak işaretli. Önce yeniden hizmete alın.',
+  'inventory.error_asset_not_disposed': 'Bu öğe zaten hizmette; yeniden hizmete alınacak bir şey yok.',
+  'inventory.error_custody_disposed':
+    'Bu öğe kayıp ya da hizmetten çıkarılmış olarak işaretli. Teslim etmeden önce yeniden hizmete alın.',
+  'inventory.error_repair_disposed':
+    'Bu öğe kayıp ya da hizmetten çıkarılmış olarak işaretli. Onarıma göndermeden önce yeniden hizmete alın.',
+  'inventory.error_field_key_taken': 'Bu çalışma alanında bu anahtara sahip bir alan zaten var.',
+  'inventory.error_field_order_stale':
+    'Bu sayfa açıkken başkası alanları değiştirdi, bu yüzden bu sıralama kaydedilmedi. Aşağıdaki liste yenilendi — sırayı yeniden verin.',
+  'inventory.error_field_limit_reached':
+    'Bir çalışma alanı aynı anda {max} özel alan tutabilir ve bu alanda hepsi dolu. Yer açmak için artık kullanılmayan bir alanı arşivleyin.',
+  'inventory.error_field_unknown':
+    'Bu çalışma alanında “{field}” adında tanımlı bir alan yok. Sayfayı yeniden yükleyin.',
+  'inventory.error_field_archived': '“{field}” alanı arşivlenmiş, bu yüzden içine bir değer yazılamaz.',
+  'inventory.error_field_required': '“{field}” zorunludur.',
+  'inventory.error_field_invalid': '“{field}” bu değeri kabul etmiyor.',
+  'inventory.error_field_no_options': 'Bir seçim alanının en az bir seçeneği olmalı.',
+  'inventory.error_field_options_unused': 'Seçenek listesini yalnızca seçim alanı kabul eder.',
   'inventory.error_unknown': 'Bu işlem gerçekleşmedi.',
 }
 

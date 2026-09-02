@@ -18,22 +18,32 @@ in Persian — and is stored in the currency's own minor units. How many decimal
 from the currency, so a yen amount takes none and a dinar takes three; anything the field cannot
 read, including more decimal places than the currency has, is refused rather than rounded.
 
-The status column holds one of `in_stock`, `assigned`, `reserved`, `under_repair`, `lost` and
-`retired`. Three of them are derived from two facts and written in the same transaction as the fact
-that moved: an open repair makes an item `under_repair`, a custodian makes it `assigned`, and
-neither makes it `in_stock`. **A repair wins that column and does not touch custody** — a laptop at
-the workshop is still the person's it was handed to, so completing a repair returns it to `assigned`
-rather than to stock. `reserved`, `lost` and `retired` wait on the features that set them, so those
-three filters correctly return nothing yet.
+The status column holds one of `in_stock`, `assigned`, `under_repair`, `lost` and `retired`
+(`reserved` is in the contract and waits on reservations, which nothing records yet). Three of them
+are derived from two facts and written in the same transaction as the fact that moved: an open
+repair makes an item `under_repair`, a custodian makes it `assigned`, and neither makes it
+`in_stock`. **A repair wins that column and does not touch custody** — a laptop at the workshop is
+still the person's it was handed to, so completing a repair returns it to `assigned` rather than to
+stock. The other two are things a person says: **mark it lost** when nobody knows where it is, which
+is allowed while somebody still holds it because they are still answerable for it; and **retire it**
+when the company is done with it — sold, scrapped, written off — which refuses an item somebody is
+holding or that is away for repair, for the same reasons archiving does. Either wins the status
+column over everything else, closes the doors that no longer make sense (nobody can be handed a lost
+item, nothing retired goes for repair) and is undone by **reinstate**, which clears what was said and
+hands the column back to custody and repairs — a laptop found under a desk reads `assigned` again
+with no handover re-recorded. Retired is not archived: a retired item stays in the list until
+somebody archives it, which it now allows.
 
 - The **Assets** screen lists them in a table, searches by name, tag or serial number, filters by
-  status and by category, hides archived rows until the switch asks for them, and pages a workspace
-  with more assets than one screen holds. All of it is one server query; nothing is filtered in the
-  browser.
+  status and by category, sorts by what was added last, by name or by tag, hides archived rows until
+  the switch asks for them, and pages a workspace with more assets than one screen holds. All of it
+  is one server query; nothing is filtered in the browser.
 - Adding an asset opens a dialog, and editing one opens the same dialog seeded from the row. The tag
   is the server's job — people read tags off stickers rather than inventing them.
-- Each row carries a menu: open, edit, archive, restore. Archiving asks first and names what it is
-  about to archive; restoring does not, because it takes nothing away.
+- Each row carries a menu: open, edit, mark as lost, retire, reinstate, archive, restore. Archiving
+  and retiring ask first and name what they are about to do; restoring and reinstating do not,
+  because they take nothing away. A note can go with a loss or a write-off, and it is kept on the
+  history entry rather than on the asset, because it describes the event.
 - The line above the table says how many assets the workspace has — the real number, from
   `stats.summary`, rather than how many rows happen to be loaded.
 - Opening an asset puts `?asset=<id>` on the URL and slides a **detail panel** over the list, so the
@@ -45,7 +55,19 @@ three filters correctly return nothing yet.
   next, moves the custodian, the date and the status together, and writes a line of history. Two
   people handing the same item over at the same instant is settled by a database exclusion
   constraint, and the one who loses is told to reload rather than shown a driver error. The person
-  receiving an item is notified; the person doing the handing is not.
+  receiving an item is notified; the person doing the handing is not. Under the holder's name the
+  panel says how many other items they are holding, and that line is a link to the list filtered
+  to them — the same list an offboarding notice links to.
+- **Custom fields** are a workspace's own questions about an asset — a cost centre, a supplier
+  reference, a MAC address, an insurance renewal. They are defined in **Settings → Inventory →
+  Fields**: a key that never changes, a name, one of seven types (text, number, date, select,
+  multiselect, checkbox, URL), whether it is required, and whether it applies to every asset or only
+  to those filed under one category. The asset form asks the ones that apply; the Details tab shows
+  their answers; the timeline names the field when a value changes. Every value is checked on the
+  server against the definition before it is stored — an unknown key, a wrong shape, a required
+  field being cleared — so the column never becomes a bag. Fields archive rather than delete, and
+  an archived field's values stay readable. Choices of a select are the words themselves, so
+  renaming one leaves what was already recorded as it was, and the settings page says so.
 - **Repairs** record what went away to be fixed, to whom, what it cost and when it came back. One
   repair can be open per item — a partial unique index decides that, not the service, so two people
   sending the same laptop away at the same instant end with one repair and a sentence rather than
@@ -100,11 +122,13 @@ three filters correctly return nothing yet.
   number that produces a duplicate tag. The same page sets the two notice windows: how far ahead of a
   warranty expiring somebody is told, and how long an item may be at a repairer before somebody is
   asked to chase it.
-- Five permissions gate it: `inventory.asset.view`, `inventory.asset.manage`,
-  `inventory.custody.manage`, `inventory.repair.manage` and `inventory.category.manage`. Reading who
-  holds what and what has been repaired rides `asset.view` rather than a key of its own — "who has
-  the projector" and "where is it" are the questions an asset register exists to answer, and the
-  custodian is already a field of every row the list returns.
+- Six permissions gate it: `inventory.asset.view`, `inventory.asset.manage`,
+  `inventory.custody.manage`, `inventory.repair.manage`, `inventory.category.manage` and
+  `inventory.field.manage`. Reading who holds what and what has been repaired rides `asset.view`
+  rather than a key of its own — "who has the projector" and "where is it" are the questions an
+  asset register exists to answer, and the custodian is already a field of every row the list
+  returns. Marking an item lost or retiring it is `asset.manage`: a statement about the record,
+  which a workspace that wants a narrower gate on write-offs makes with a custom role.
 - Three **capabilities** decide how much of it a workspace has: `core` is required and always on,
   and `repairs` and `attachments` are switches an administrator can turn off. A capability that is
   off answers **404, not 403** — a workspace that does not record repairs has no such surface, so
@@ -113,31 +137,25 @@ three filters correctly return nothing yet.
 - Its strings ship in the five languages the platform speaks — English, Arabic, German, Persian,
   Turkish.
 
-The API is twenty-four procedures under `/api/inventory`:
-`assets.{list,get,create,update,archive,history}`,
+The API is thirty-two procedures under `/api/inventory`:
+`assets.{list,get,create,update,archive,history,markLost,retire,reinstate}`,
 `custody.{assign,transfer,return,history,byUser}`,
 `categories.{list,create,update,archive,reorder}`,
+`fields.{list,create,update,archive,reorder}`,
 `repairs.{list,create,update,complete}`,
 `attachments.{list,add,remove}` and
 `stats.summary`.
-An asset's custom values are settable by nothing, and wait on custom fields below.
 
 Two more answers are reachable only from another service, over `kernel.call` —
 `inventory.asset.byId` and `inventory.assets.byCustodian`. They run with elevated access and are
 refused to anybody who is not a service, so that a module holding an id never has to learn the shape
 of `mod_inventory`.
 
-## Not built yet
+## Not built
 
-Nothing here has a screen. It is a table in `mod_inventory` and nothing more. A register is worth
-designing whole, and a migration that adds a column later is cheaper than one that reshapes a table.
-A table is not a feature, and this section stays until each one ships.
-
-- **Custom fields** — a workspace's own fields on an asset. `assets.custom` holds the values;
-  nothing defines a field, so `create` and `update` refuse to write into it at all.
-
-Further off, and with nothing in the schema yet: locations and stock control (bins, counts, reorder
-points), purchasing, depreciation, and reservations.
+Everything the schema holds has a screen. What is further off, and has nothing in the schema yet:
+locations and stock control (bins, counts, reorder points), purchasing, depreciation, and
+reservations — which is what the `reserved` status waits on.
 
 ## Developing
 

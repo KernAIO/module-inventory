@@ -182,6 +182,22 @@ export const inventoryClientModule = defineClientModule({
       order: 2,
       component: () => import('./settings/CategoriesSettings.svelte'),
     },
+    {
+      /**
+       * The workspace's own fields, gated the way categories are and for the same reason: they are
+       * this module's data, and `inventory.field.manage` is exactly what `fields.create`, `.update`,
+       * `.archive` and `.reorder` require on the server.
+       */
+      id: 'fields',
+      get label() {
+        return t('settings_fields')
+      },
+      icon: 'list-checks',
+      scope: 'workspace',
+      permission: INVENTORY_PERMISSIONS.fields,
+      order: 3,
+      component: () => import('./settings/FieldsSettings.svelte'),
+    },
   ],
 })
 

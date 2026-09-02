@@ -22,10 +22,13 @@ import { defineCapabilities } from '@kernhq/contracts'
  *   the rows stay exactly where they are. Anything that would need data thrown away to reverse is
  *   not a capability, however much it looks like one.
  *
- * The rest arrive with the work that makes them mean something: `labels` with the finished register;
- * `custom_fields` and `locations` beside them; `stock` and `procurement` with stock control;
- * `depreciation` and `reservations` last. Adding one here before its procedures exist is the mistake
- * this comment is here to prevent.
+ * The rest arrive with the work that makes them mean something: `labels` and `locations` with the
+ * register; `stock` and `procurement` with stock control; `depreciation` and `reservations` last.
+ * Adding one here before its procedures exist is the mistake this comment is here to prevent.
+ *
+ * **Custom fields are deliberately not one.** A workspace that defines no field sees nothing — no
+ * section on the form, no rows on the panel — so the feature switches itself off by being empty,
+ * and a switch beside that would be one that changes nothing.
  */
 export const inventoryCapabilities = defineCapabilities([
   {

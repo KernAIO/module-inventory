@@ -13,30 +13,150 @@ export const MODULE_ID = 'inventory'
 
 /**
  * An asset's lifecycle. `in_stock` and `assigned` follow custody (an open row in `custody_periods`
- * means assigned); `under_repair` follows an open repair; `reserved` follows a booking that has not
- * been collected; `lost` and `retired` are set by hand when an item stops being usable.
+ * means assigned); `under_repair` follows an open repair; `lost` and `retired` follow a
+ * **disposition** somebody set by hand — `assets.markLost` and `assets.retire` — and `reserved`
+ * follows a booking, which nothing records yet.
  *
  * Stored rather than derived, because every list filter asks for it — and kept in step inside the
  * same transaction that writes the row it derives from, never by a job afterwards.
+ *
+ * **A disposition wins the column.** A laptop Ada lost is still Ada's — the custody period stays
+ * open and she is still answerable — but `status` answers *where is it*, and "nobody knows" is the
+ * answer. `deriveStatus` in `src/server/services/status.ts` puts the disposition first for that
+ * reason, and `assets.reinstate` is the one door out of either: clearing it hands the column back to
+ * custody and repairs, so an item found under a desk reads `assigned` again without anybody
+ * re-recording the handover.
  *
  * **`under_repair` belongs to the `repairs` capability**, so a workspace with that switch off never
  * has an asset in it: the procedure that ends a repair answers 404 there, and a status nothing can
  * move an item out of is a register the workspace cannot correct. The one thing a job does here is
  * bring the rows *nobody touches* back into step after that switch moves, in both directions —
- * `deriveStatus` in `src/server/services/status.ts` argues it, and nothing is destroyed either way.
+ * `deriveStatus` argues it, and nothing is destroyed either way.
  */
 export const AssetStatus = z.enum(['in_stock', 'assigned', 'reserved', 'under_repair', 'lost', 'retired'])
 export type AssetStatus = z.infer<typeof AssetStatus>
 
 /**
- * A value a workspace defined for itself, stored under its `key` in `assets.custom`.
+ * The two things a person can say about an item that nothing else in the register records.
+ *
+ * `lost` means nobody knows where it is; `retired` means the company is done with it — sold,
+ * scrapped, written off. Both are facts somebody states rather than facts the module derives, which
+ * is why they are a column of their own rather than values something writes into `status` directly:
+ * a status is a derivation and can be recomputed, and a disposition is a decision and cannot.
+ *
+ * **Retired is not archived.** Archiving takes a row out of the default list; retiring says what
+ * happened to the thing. A register keeps its retired items *in* the list for as long as somebody
+ * wants to see what was disposed of and when, and archives them once nobody does — two steps, each
+ * meaning something, and `assets.archive` accepts a retired item because nothing holds it.
+ */
+export const Disposition = z.enum(['lost', 'retired'])
+export type Disposition = z.infer<typeof Disposition>
+
+/**
+ * A value a workspace defined for itself, stored under its field's `key` in `assets.custom`.
  *
  * `unknown` rather than a union: the field definition says what the type is, and validating a value
  * against a definition the client may not have loaded yet would fail honest input. The server checks
- * it against `field_defs` before writing.
+ * every key against `field_defs` before writing — `FieldService.validate` is the one place the rules
+ * live — and refuses a key nothing defines, so the column never becomes a bag.
  */
 export const CustomValues = z.record(z.string(), z.unknown())
 export type CustomValues = z.infer<typeof CustomValues>
+
+/**
+ * What kind of value a workspace-defined field holds.
+ *
+ * Seven, and deliberately not tracker's fourteen. An asset register asks for a supplier reference,
+ * a cost centre, a MAC address, an insurance renewal — one value each, typed by a person off a
+ * label or an invoice. `user`, `relation` and `formula` are the ones an issue tracker needs and a
+ * register does not; the day one is needed here it arrives with the screen that renders it.
+ */
+export const FieldType = z.enum(['text', 'number', 'date', 'select', 'multiselect', 'checkbox', 'url'])
+export type FieldType = z.infer<typeof FieldType>
+
+/**
+ * A field's key: what its value is stored under in `assets.custom`, and the one thing about a field
+ * that cannot change after it is created.
+ *
+ * Lowercase letters, digits and underscores, starting with a letter — `cost_centre`, `mac_address`.
+ * Renaming a key would orphan every value already written under the old one, so `update` does not
+ * take it; a workspace that wants a different key archives the field and makes another.
+ */
+export const FieldKey = z
+  .string()
+  .min(1)
+  .max(40)
+  .regex(/^[a-z][a-z0-9_]*$/, 'a key is lowercase letters, digits and underscores, starting with a letter')
+export type FieldKey = z.infer<typeof FieldKey>
+
+/** How many choices a `select` or `multiselect` may offer. A picker longer than this is a search. */
+export const MAX_FIELD_OPTIONS = 100
+
+/** How many fields a workspace may keep live. Bounds `fields.reorder`, and `create` refuses at it. */
+export const MAX_LIVE_FIELDS = 100
+
+/**
+ * A field a workspace defined for its own assets.
+ *
+ * `categoryId` narrows it: a field for laptops only (a MAC address) is asked about only on assets
+ * filed under Laptops, where a workspace-wide one (a cost centre) is asked about on every asset.
+ * Null means workspace-wide. An asset moved out of the category keeps whatever value it had — the
+ * value is a fact that was recorded, and re-filing does not un-record it — it just stops being
+ * asked for.
+ *
+ * `options` is the list of choices for `select` and `multiselect`, in the order they are offered,
+ * and is empty for every other type. Plain strings rather than `{id, label}` pairs: an asset
+ * register's choices are the words themselves — "Berlin", "Finance", "Leased" — and a value that
+ * is the word survives being read by anything, where an id needs the definition beside it to mean
+ * anything. Renaming a choice therefore means the values already written under it keep the old
+ * word, which `update` documents and the settings screen says out loud.
+ *
+ * Archived rather than deleted, for the reason categories are: values already written under the
+ * key stay readable, the field stops being asked for and stops being writable, and a restore brings
+ * it back with every value intact.
+ */
+export const FieldDef = z.object({
+  id: z.uuid(),
+  workspaceId: WorkspaceId,
+  categoryId: z.uuid().nullable(),
+  key: FieldKey,
+  name: z.string().min(1).max(80),
+  description: z.string().max(500).nullable(),
+  type: FieldType,
+  options: z.array(z.string().min(1).max(120)),
+  required: z.boolean(),
+  order: z.number().int(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  archivedAt: z.string().nullable(),
+})
+export type FieldDef = z.infer<typeof FieldDef>
+
+/**
+ * What a person says when they define a field. The key and the type are fixed at creation and
+ * absent from the patch, because a value already written under them cannot be reinterpreted.
+ *
+ * No `.default()` anywhere, for the reason `AssetInput` gives: `update` is `.partial()` of this and
+ * a default survives partialling, so a patch that renamed a field would silently un-require it.
+ * `create` fills the two it needs on the server.
+ */
+export const FieldInput = z.object({
+  name: z.string().trim().min(1).max(80),
+  description: z.string().max(500).nullish(),
+  categoryId: z.uuid().nullish(),
+  options: z.array(z.string().trim().min(1).max(120)).max(MAX_FIELD_OPTIONS).optional(),
+  required: z.boolean().optional(),
+})
+export type FieldInput = z.infer<typeof FieldInput>
+
+export const FieldCreateInput = FieldInput.extend({
+  key: FieldKey,
+  type: FieldType,
+})
+export type FieldCreateInput = z.infer<typeof FieldCreateInput>
+
+export const FieldPatchInput = FieldInput.partial()
+export type FieldPatchInput = z.infer<typeof FieldPatchInput>
 
 /**
  * A workspace's own grouping of what it owns — Laptops, Furniture, Cameras.
@@ -135,8 +255,14 @@ export type CustodyPeriod = z.infer<typeof CustodyPeriod>
  * own history the moment a newer image had written an action the older enum does not list — a
  * timeline that 500s rather than one that says a little less. The client renders a sentence per
  * action it knows and a neutral one for anything else. What is written today is `created`,
- * `updated`, `assigned`, `transferred`, `returned`, `retired`, `restored`, `repair_logged`,
- * `repair_completed`, `attachment_added` and `attachment_removed`.
+ * `updated`, `assigned`, `transferred`, `returned`, `archived`, `restored`, `lost`, `written_off`,
+ * `reinstated`, `repair_logged`, `repair_completed`, `attachment_added` and `attachment_removed`.
+ *
+ * `archived` was written as `retired` until 0.5.0, and rows saying so are still in every database
+ * that ran an earlier image; the client reads both as the same sentence. It changed because the
+ * word now means something else in this module — a *retired* asset is one the company has written
+ * off, which is a disposition and not an archive — and one word for two facts is a timeline nobody
+ * can read.
  */
 export const AssetHistoryEntry = z.object({
   id: z.uuid(),
@@ -166,6 +292,13 @@ export const Asset = z.object({
    */
   custodianUserId: z.uuid().nullable(),
   custodySince: z.string().nullable(),
+  /**
+   * What somebody said happened to it, and when they said it. Null for an item still in service.
+   * `status` is derived from this first — see `Disposition` — so the two never disagree, and a
+   * screen can offer *reinstate* on exactly the rows that have one.
+   */
+  disposition: Disposition.nullable(),
+  dispositionAt: z.string().nullable(),
   serialNumber: z.string().max(200).nullable(),
   location: z.string().max(200).nullable(),
   purchasedOn: z.string().nullable(),
@@ -344,6 +477,16 @@ export const AssetSort = z.enum(['recent', 'name', 'code'])
 export type AssetSort = z.infer<typeof AssetSort>
 
 /**
+ * What `markLost` and `retire` take: a note, and nothing else.
+ *
+ * Where it went, who signed it off, what the insurer said — one free-text line, kept on the history
+ * entry rather than on the asset, because it describes the *event* and an item reinstated and lost
+ * again has two of them.
+ */
+export const DispositionInput = z.object({ note: z.string().max(500).nullish() })
+export type DispositionInput = z.infer<typeof DispositionInput>
+
+/**
  * Everything a person can say about an asset. `create` requires `name`; `update` takes any subset.
  *
  * **No field here carries `.default()`, and that is load-bearing.** `update` is built from
@@ -367,9 +510,16 @@ export const AssetInput = z.object({
   priceMinor: z.number().int().min(0).nullish(),
   currency: z.string().length(3).nullish(),
   photoFileId: z.uuid().nullish(),
-  // `custom` is deliberately absent: there is nothing to validate a value against until
-  // `fields.*` exists, and accepting arbitrary JSON into a column a workspace has not defined
-  // is how a schemaless field bag becomes permanent. It arrives with the field definitions.
+  /**
+   * Values for the workspace's own fields, keyed by field key.
+   *
+   * **A patch merges, it does not replace.** `update` takes the keys it is handed and leaves every
+   * other key as it was, so a form that only knows about the fields it rendered cannot wipe a value
+   * it never saw; `null` under a key clears that one value. Every key is checked against
+   * `field_defs` on the server — an unknown key, an archived field, a value of the wrong shape or a
+   * required field being cleared are each refused with a sentence naming the field.
+   */
+  custom: CustomValues.optional(),
 })
 export type AssetInput = z.infer<typeof AssetInput>
 

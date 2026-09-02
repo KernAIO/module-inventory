@@ -18,7 +18,15 @@ import type { Directory } from '../members.js'
 import { nameOf, resolveName } from '../members.js'
 import { formatPrice } from '../price.js'
 import { inventoryKeys } from '../query.js'
-import { actionKey, changeLineKind, fieldKey, noteOf, personIdOf, subjectOf } from '../timeline.js'
+import {
+  actionKey,
+  changeLineKind,
+  customKeyOf,
+  fieldKey,
+  noteOf,
+  personIdOf,
+  subjectOf,
+} from '../timeline.js'
 import TimelineText from './TimelineText.svelte'
 
 /**
@@ -40,6 +48,13 @@ interface Props {
   /** A category id as its name, or null when the id names nothing this workspace still lists. */
   categoryName: (id: string) => string | null
   /**
+   * A custom field's key as the field's name, or null when no definition the panel loaded carries
+   * that key. A change to a custom value is stored under `custom.<key>`, and "cost_centre set to
+   * 4100" is a column name on somebody's screen — the same defect `fieldKey` exists to prevent for
+   * the built-in fields, answered from the panel's own query rather than from a second one here.
+   */
+  fieldName: (key: string) => string | null
+  /**
    * The asset's currency now, for reading a stored `priceMinor` back into an amount.
    *
    * How many decimal places minor units carry is a fact about the currency — none for yen, three
@@ -49,7 +64,7 @@ interface Props {
    */
   currency: string | null
 }
-const { workspaceId, assetId, dir, categoryName, currency }: Props = $props()
+const { workspaceId, assetId, dir, categoryName, fieldName, currency }: Props = $props()
 
 const api = getInventoryApi()
 
@@ -98,9 +113,30 @@ const words = $derived({
  */
 function readable(field: string, value: unknown, money: string | null): string {
   if (value === null || value === undefined || value === '') return '—'
+  if (customKeyOf(field)) return customReadable(value)
   if (field === 'categoryId') return categoryName(String(value)) ?? t('category_none')
   if (field === 'priceMinor') return formatPrice(Number(value), messageLocale(), money)
   if (field === 'purchasedOn' || field === 'warrantyUntil') return formatDate(String(value))
+  return String(value)
+}
+
+/**
+ * A custom value, read from its own shape rather than from a definition.
+ *
+ * The entry names the key and not the type, and the definition may have been archived out of the
+ * list the panel loaded — so the value is read for what it is: a boolean is a word, a list is joined
+ * the way the reader's language joins one, a number is in their own digits, and a string of exactly
+ * the shape a date field stores (`2027-03-14`) is a date. That last one is a heuristic and is named
+ * as one; a text field somebody typed an ISO date into is shown as a date, which is what they meant.
+ */
+function customReadable(value: unknown): string {
+  if (typeof value === 'boolean') return value ? t('yes') : t('no')
+  if (Array.isArray(value))
+    return new Intl.ListFormat(messageLocale(), { style: 'long', type: 'conjunction' }).format(
+      value.map(String),
+    )
+  if (typeof value === 'number') return new Intl.NumberFormat(messageLocale()).format(value)
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) return formatDate(value)
   return String(value)
 }
 
@@ -126,8 +162,14 @@ function currencyFor(entry: AssetHistoryEntry, side: 'from' | 'to'): string | nu
  * client has never heard of prints its own name — ugly and true, because the rows outlive the image
  * that wrote them — and that one is a Latin identifier dropped into a Persian sentence, so it is
  * isolated here rather than left to reorder the words on either side of it.
+ *
+ * A custom field's name is a value somebody typed, so it is isolated too; and when the panel has no
+ * definition for the key — a field archived out of the list it loaded, or a row written by a newer
+ * image — the key itself is printed, which is ugly and true where a guessed label would be neither.
  */
 function fieldLabel(field: string): string {
+  const custom = customKeyOf(field)
+  if (custom) return isolate(fieldName(custom) ?? custom)
   const key = fieldKey(field)
   return key ? t(key) : isolate(field)
 }

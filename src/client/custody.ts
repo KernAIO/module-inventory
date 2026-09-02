@@ -16,6 +16,12 @@ export interface CustodyState {
   held: boolean
   /** The workspace has taken it out of the register; the server refuses every handover. */
   archived: boolean
+  /**
+   * Somebody said it is lost or retired — `assets.disposition` is set. The server refuses to
+   * *give* such an item to anybody and lets it be taken back, and the split is the whole point:
+   * the person answerable for a lost laptop has to be able to stop being answerable for it.
+   */
+  disposed: boolean
   /** This person holds `inventory.custody.manage`. */
   may: boolean
 }
@@ -27,8 +33,14 @@ export interface CustodyState {
  * archived item, where the panel says *why* instead. An archived item deliberately offers nothing
  * rather than a disabled row of buttons: the reason is one sentence, and one sentence beats three
  * controls that cannot be pressed.
+ *
+ * A disposed item offers `return` and nothing else, and only while somebody holds it. `assign` and
+ * `transfer` would each 409 with `inventory.custody.disposed` on every press, so the panel shows
+ * the sentence that says to reinstate it first in their place — and keeps the one door the server
+ * leaves open, because a lost item still has somebody answerable for it until it is taken back.
  */
 export function custodyActions(state: CustodyState): CustodyAction[] {
   if (!state.may || state.archived) return []
+  if (state.disposed) return state.held ? ['return'] : []
   return state.held ? ['transfer', 'return'] : ['assign']
 }

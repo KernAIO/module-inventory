@@ -3,6 +3,7 @@ import { AssetService } from './assets.js'
 import { AttachmentService } from './attachments.js'
 import { CategoryService } from './categories.js'
 import { CustodyService } from './custody.js'
+import { FieldService } from './fields.js'
 import { NotifyService } from './notify.js'
 import { OffboardingService } from './offboarding.js'
 import { RepairService } from './repairs.js'
@@ -13,6 +14,8 @@ export interface InventoryServices {
   notify: NotifyService
   assets: AssetService
   categories: CategoryService
+  /** The workspace's own fields, and the check every value written under one goes through. */
+  fields: FieldService
   custody: CustodyService
   repairs: RepairService
   attachments: AttachmentService
@@ -31,7 +34,8 @@ export function inventoryServices(kernel: Kernel): InventoryServices {
   if (existing) return existing
 
   const notify = new NotifyService(kernel)
-  const assets = new AssetService(kernel, notify)
+  const fields = new FieldService()
+  const assets = new AssetService(kernel, notify, fields)
   const categories = new CategoryService()
   const custody = new CustodyService(notify)
   const repairs = new RepairService(notify)
@@ -44,6 +48,7 @@ export function inventoryServices(kernel: Kernel): InventoryServices {
     notify,
     assets,
     categories,
+    fields,
     custody,
     repairs,
     attachments,

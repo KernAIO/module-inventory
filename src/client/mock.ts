@@ -5,9 +5,13 @@ import type {
   Attachment,
   Category,
   CustodyPeriod,
+  Disposition,
+  FieldDef,
+  FieldType,
   InventoryStats,
   Repair,
 } from '../contract/index.js'
+import { MAX_LIVE_FIELDS } from '../contract/index.js'
 
 /**
  * The in-memory implementation of this module's API.
@@ -39,6 +43,15 @@ import type {
  * and completing one returns the item to `assigned` rather than to `in_stock` when somebody still
  * holds it. `statusFor` below is this file's copy of `deriveStatus` on the server; read them as one
  * pair and change them as one pair.
+ *
+ * A disposition — lost, retired — wins the status column over both, exactly as it does there, and
+ * the refusals around it are the server's: nothing lost or retired can be handed to anybody or
+ * sent for repair, a held item can be lost but not retired, and only `reinstate` is the way back.
+ * Two seeds carry one so the demo shows the badges, the sentence under them, and the buttons that
+ * disappear.
+ *
+ * The workspace's own fields are here too, with the one rule that matters for a demo: a value is
+ * merged, never replaced, and a key nothing defines is refused rather than stored.
  */
 type AssetSort = 'recent' | 'name' | 'code'
 
@@ -83,6 +96,10 @@ interface Seed {
   serialNumber?: string | null
   location?: string | null
   warrantyUntil?: string | null
+  /** What somebody said happened to it. Kept in step with `status` here exactly as the server keeps it. */
+  disposition?: Disposition
+  /** Values under the seeded fields' keys, so the panel and the form have something to show. */
+  custom?: Record<string, unknown>
   archived?: boolean
 }
 
@@ -96,6 +113,7 @@ const SEEDS: Seed[] = [
     serialNumber: 'C02X1234JGH7',
     location: 'Istanbul · 3rd floor',
     warrantyUntil: '2027-03-14',
+    custom: { cost_centre: 'Engineering', mac_address: 'A4:83:E7:12:9B:C0' },
   },
   {
     code: 'INV-0002',
@@ -120,15 +138,62 @@ const SEEDS: Seed[] = [
     categoryKey: 'furniture',
     custodian: PEOPLE.ines,
     location: 'Istanbul · 2nd floor',
+    custom: { cost_centre: 'Operations' },
   },
+  // Lost on a shoot, and still in the list: a disposition is a fact about the item, not a way
+  // out of the register. The panel says since when, and offers Reinstate.
   {
     code: 'INV-0005',
     name: 'Canon EOS R6',
-    status: 'reserved',
+    status: 'lost',
+    disposition: 'lost',
     categoryKey: 'cameras',
     location: 'Istanbul · store room',
   },
-  { code: 'INV-0006', name: 'ThinkPad X1 Carbon', status: 'retired', archived: true },
+  // Retired and **not** archived, on purpose: retiring says what happened to it, archiving takes it
+  // out of the list, and a register keeps its retired items visible until somebody tidies them.
+  {
+    code: 'INV-0006',
+    name: 'ThinkPad X1 Carbon',
+    status: 'retired',
+    disposition: 'retired',
+    categoryKey: 'laptops',
+  },
+  // One archived, so the Show archived switch has something to reveal.
+  { code: 'INV-0007', name: 'HP LaserJet Pro', status: 'in_stock', archived: true },
+]
+
+interface FieldSeed {
+  key: string
+  name: string
+  description: string | null
+  type: FieldType
+  options: string[]
+  /** A category key from `CATEGORY_SEEDS`, or none for a workspace-wide field. */
+  categoryKey?: string
+}
+
+/**
+ * Two fields, one of each scope: a cost centre every asset is asked about, and a MAC address only
+ * laptops are. Together they show the two things the form has to get right — a choice list, and a
+ * field that appears and disappears as the category changes.
+ */
+const FIELD_SEEDS: FieldSeed[] = [
+  {
+    key: 'cost_centre',
+    name: 'Cost centre',
+    description: 'Which budget it was bought from.',
+    type: 'select',
+    options: ['Engineering', 'Finance', 'Operations'],
+  },
+  {
+    key: 'mac_address',
+    name: 'MAC address',
+    description: null,
+    type: 'text',
+    options: [],
+    categoryKey: 'laptops',
+  },
 ]
 
 /**
@@ -146,18 +211,21 @@ const SEEDS: Seed[] = [
  * fallback path — so the demo would show English prose where the product shows Persian, which is
  * exactly the defect that was just fixed, reproduced by the thing meant to reproduce the product.
  *
- * The shape matches `kernErrorToORPC`: `{ reason, …details }` under `data`, not beside it.
+ * The shape matches `kernErrorToORPC`: `{ reason, …details }` under `data`, not beside it. The
+ * details are what a field refusal carries — `field`, the field's own name — so `errors.ts` can say
+ * «Cost centre is required» here exactly as it does against the server.
  */
 class MockApiError extends Error {
-  readonly data: { reason: string } | undefined
+  readonly data: ({ reason: string } & Record<string, unknown>) | undefined
   constructor(
     readonly code: 'BAD_REQUEST' | 'NOT_FOUND' | 'CONFLICT',
     message: string,
     reason?: string,
+    details: Record<string, unknown> = {},
   ) {
     super(message)
     this.name = 'MockApiError'
-    this.data = reason ? { reason } : undefined
+    this.data = reason ? { reason, ...details } : undefined
   }
 }
 
@@ -259,7 +327,7 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
    * ever equal a category id, a period id — or one of the shell's mock user ids, which live in the
    * same `…-8000-…` space and would otherwise collide with the first asset.
    */
-  const counters = { asset: 1, category: 1, period: 1, history: 1, repair: 1, attachment: 1 }
+  const counters = { asset: 1, category: 1, period: 1, history: 1, repair: 1, attachment: 1, field: 1 }
   const newId = (kind: keyof typeof counters, group: string) =>
     `01920000-0000-7000-${group}-${String(counters[kind]++).padStart(12, '0')}`
   const assetId = () => newId('asset', '8001')
@@ -268,6 +336,8 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
   const historyId = () => newId('history', '8004')
   const repairId = () => newId('repair', '8005')
   const attachmentId = () => newId('attachment', '8006')
+  // `8007` is the seeded attachments' file ids, which live in core's space rather than this one.
+  const fieldId = () => newId('field', '8008')
 
   let nextCodeNumber = SEEDS.length + 1
   const pad = (n: number) => `INV-${String(n).padStart(4, '0')}`
@@ -303,6 +373,24 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
   }))
   const categoryByKey = new Map(CATEGORY_SEEDS.map((seed, i) => [seed.key, categories[i]!.id]))
 
+  // --------------------------------------------------------------------------------- fields
+
+  const fields: FieldDef[] = FIELD_SEEDS.map((seed, order) => ({
+    id: fieldId(),
+    workspaceId: '' as Asset['workspaceId'],
+    categoryId: seed.categoryKey ? (categoryByKey.get(seed.categoryKey) ?? null) : null,
+    key: seed.key,
+    name: seed.name,
+    description: seed.description,
+    type: seed.type,
+    options: seed.options,
+    required: false,
+    order,
+    createdAt: daysAgo(50),
+    updatedAt: daysAgo(50),
+    archivedAt: null,
+  }))
+
   // -------------------------------------------------------------------------------- assets
 
   function blank(code: string, seed: Partial<Seed> & { name?: string } = {}): Asset {
@@ -317,6 +405,10 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
       status: seed.status ?? 'in_stock',
       custodianUserId: seed.custodian ?? null,
       custodySince: seed.custodian ? daysAgo(21) : null,
+      disposition: seed.disposition ?? null,
+      // A lost item was lost recently — somebody is still looking — where a retired one was
+      // written off a while ago and is waiting to be archived.
+      dispositionAt: seed.disposition ? daysAgo(seed.disposition === 'lost' ? 3 : 12) : null,
       serialNumber: seed.serialNumber ?? null,
       location: seed.location ?? null,
       purchasedOn: null,
@@ -325,7 +417,7 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
       currency: null,
       warrantyUntil: seed.warrantyUntil ?? null,
       photoFileId: null,
-      custom: {},
+      custom: { ...(seed.custom ?? {}) },
       createdAt: now,
       updatedAt: now,
       archivedAt: seed.archived ? now : null,
@@ -418,6 +510,20 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
         data: { userId: asset.custodianUserId },
       })
   }
+  // The two dispositions the seeds carry, recorded the way the server records them — `lost` and
+  // `written_off` — so the timeline of each says who said it and when, with the note beside it.
+  for (const asset of assets) {
+    if (!asset.disposition || !asset.dispositionAt) continue
+    appendHistory(asset, asset.disposition === 'lost' ? 'lost' : 'written_off', {
+      occurredAt: asset.dispositionAt,
+      data: {
+        note:
+          asset.disposition === 'lost'
+            ? 'Not in the case after the Berlin shoot.'
+            : 'Sold to a staff member.',
+      },
+    })
+  }
 
   // --------------------------------------------------------------- repairs and attachments
 
@@ -427,12 +533,15 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
   /**
    * This file's copy of the server's `deriveStatus`, and it has to stay a copy of it.
    *
-   * Repair wins the status column, custody keeps the custodian column, and neither cancels the
-   * other — a laptop at the repairer is still whoever's it was. A mock that wrote `assigned`
-   * unconditionally after a handover would show a demo audience an item as back in the office while
-   * its repair card said it was in a workshop.
+   * A disposition wins over everything: a lost laptop is still Dan's, and still at the repairer if
+   * that is where it went missing, but `status` answers *where is it* and "nobody knows" is the
+   * answer. Then repair wins over custody, custody keeps the custodian column, and neither cancels
+   * the other — a laptop at the repairer is still whoever's it was. A mock that wrote `assigned`
+   * unconditionally after a handover would show a demo audience an item as back in the office
+   * while its repair card said it was in a workshop.
    */
   const statusFor = (asset: Asset): AssetStatus => {
+    if (asset.disposition) return asset.disposition
     if (repairs.some((repair) => repair.assetId === asset.id && repair.returnedOn === null))
       return 'under_repair'
     return asset.custodianUserId ? 'assigned' : 'in_stock'
@@ -581,6 +690,136 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
     return asset
   }
 
+  /**
+   * Nor can a lost or retired item be *given* to anybody — the server's `stamp` refuses it on the
+   * two verbs that hand something over and lets a return through, because the person answerable
+   * for a lost laptop has to be able to stop being answerable for it.
+   */
+  const givable = (asset: Asset) => {
+    if (!asset.disposition) return asset
+    throw new MockApiError(
+      'CONFLICT',
+      asset.disposition === 'lost'
+        ? 'This item is marked lost. Reinstate it before handing it over.'
+        : 'This item is retired. Reinstate it before handing it over.',
+      'inventory.custody.disposed',
+    )
+  }
+
+  /** An item can only be lost or retired from service — not from the archive, and not twice. */
+  const inService = (id: string) => {
+    const asset = find(id)
+    if (asset.archivedAt)
+      throw new MockApiError(
+        'CONFLICT',
+        'This item is archived. Restore it before changing what happened to it.',
+        'inventory.asset.archived',
+      )
+    if (asset.disposition)
+      throw new MockApiError(
+        'CONFLICT',
+        asset.disposition === 'lost'
+          ? 'This item is already marked lost. Reinstate it first if it turned up.'
+          : 'This item is already retired. Reinstate it first if that was a mistake.',
+        'inventory.asset.already_disposed',
+      )
+    return asset
+  }
+
+  /** The write both dispositions share, once their own refusals have been made. */
+  const dispose = (asset: Asset, disposition: Disposition, note: string | null | undefined) => {
+    const now = new Date().toISOString()
+    asset.disposition = disposition
+    asset.dispositionAt = now
+    restamp(asset)
+    appendHistory(asset, disposition === 'lost' ? 'lost' : 'written_off', {
+      data: note ? { note } : {},
+    })
+    return stamp(asset)
+  }
+
+  // --------------------------------------------------------------------- the workspace's fields
+
+  const findField = (id: string) => {
+    const field = fields.find((row) => row.id === id)
+    if (!field) throw new MockApiError('NOT_FOUND', 'Field not found')
+    return field
+  }
+
+  /** One past the highest position in use, archived rows counted — the server's `appended()`. */
+  const appendedFieldOrder = () => fields.reduce((max, row) => Math.max(max, row.order), -1) + 1
+
+  const roomForOneMoreField = () => {
+    if (fields.filter((row) => !row.archivedAt).length < MAX_LIVE_FIELDS) return
+    throw new MockApiError(
+      'CONFLICT',
+      `This workspace already has ${MAX_LIVE_FIELDS} fields, which is as many as an asset form will hold. Archive one it no longer uses to make room.`,
+      'inventory.field.limit_reached',
+    )
+  }
+
+  /**
+   * The choices, if the type takes any — and none, if it does not. The server's two refusals,
+   * because a settings screen that cannot reproduce them cannot show what it says next to them.
+   */
+  const checkOptions = (type: FieldType, options: string[] | undefined): string[] => {
+    const cleaned = [...new Set((options ?? []).map((option) => option.trim()).filter(Boolean))]
+    const takesChoices = type === 'select' || type === 'multiselect'
+    if (takesChoices && cleaned.length === 0)
+      throw new MockApiError(
+        'BAD_REQUEST',
+        'A choice field needs at least one choice.',
+        'inventory.field.no_options',
+      )
+    if (!takesChoices && cleaned.length > 0)
+      throw new MockApiError(
+        'BAD_REQUEST',
+        `A ${type} field does not take a list of choices.`,
+        'inventory.field.options_unused',
+      )
+    return takesChoices ? cleaned : []
+  }
+
+  /**
+   * The values an asset will hold after a write — the server's `FieldService.apply`, lightly.
+   *
+   * A patch **merges**: a key not mentioned is left alone, and `null`, `''` or `[]` under one clears
+   * it. A key nothing defines is refused with the field named, and so is an archived one; that is
+   * the whole of the validation here. The shape of each value is the server's business, and a demo
+   * that typed a letter into a number field would be shown the real refusal there.
+   */
+  const applyCustom = (
+    current: Record<string, unknown>,
+    patch: Record<string, unknown> | undefined,
+  ): Record<string, unknown> => {
+    const next = { ...current }
+    for (const [key, raw] of Object.entries(patch ?? {})) {
+      const def = fields.find((row) => row.key === key)
+      if (!def)
+        throw new MockApiError(
+          'BAD_REQUEST',
+          `No field is defined under the key “${key}” in this workspace.`,
+          'inventory.field.unknown',
+          { field: key },
+        )
+      if (def.archivedAt)
+        throw new MockApiError(
+          'BAD_REQUEST',
+          `The field “${def.name}” is archived, so nothing can be written under it.`,
+          'inventory.field.archived',
+          { field: def.name },
+        )
+      const cleared =
+        raw === null ||
+        raw === undefined ||
+        (typeof raw === 'string' && raw.trim() === '') ||
+        (Array.isArray(raw) && raw.length === 0)
+      if (cleared) delete next[key]
+      else next[key] = typeof raw === 'string' ? raw.trim() : raw
+    }
+    return next
+  }
+
   const listAssets = ({
     q,
     status,
@@ -693,6 +932,9 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
 
       create: async ({ workspaceId, ...rest }: { workspaceId: string } & Record<string, unknown>) => {
         remember(workspaceId)
+        // Checked before the row exists, as the server checks it: an unknown key is refused and
+        // nothing is created.
+        const custom = applyCustom({}, rest.custom as Record<string, unknown> | undefined)
         const asset: Asset = {
           ...blank(pad(nextCodeNumber++)),
           name: String(rest.name ?? ''),
@@ -705,6 +947,7 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
           warrantyUntil: (rest.warrantyUntil as string | undefined) ?? null,
           priceMinor: (rest.priceMinor as number | undefined) ?? null,
           currency: (rest.currency as string | undefined) ?? null,
+          custom,
         }
         assets.push(asset)
         appendHistory(asset, 'created')
@@ -714,8 +957,12 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
       update: async ({
         assetId: id,
         workspaceId,
+        custom: customPatch,
         ...rest
-      }: { assetId: string; workspaceId?: string } & Record<string, unknown>) => {
+      }: { assetId: string; workspaceId?: string; custom?: Record<string, unknown> } & Record<
+        string,
+        unknown
+      >) => {
         remember(workspaceId)
         const asset = find(id)
         // The diff before the assignment, so the timeline records what actually moved — the server
@@ -723,9 +970,22 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
         const changes = Object.entries(rest)
           .filter(([field, value]) => (asset as Record<string, unknown>)[field] !== value)
           .map(([field, value]) => ({ field, from: (asset as Record<string, unknown>)[field], to: value }))
+        /**
+         * The custom values, merged and checked, and one diff line per key that moved — named
+         * `custom.<key>` so the timeline can look the field's name up, exactly as the server
+         * writes it. Compared as JSON because a multiselect is an array and two equal arrays are
+         * not `===`.
+         */
+        const previousCustom = asset.custom
+        const nextCustom = applyCustom(previousCustom, customPatch)
+        for (const key of new Set([...Object.keys(previousCustom), ...Object.keys(nextCustom)])) {
+          const from = previousCustom[key] ?? null
+          const to = nextCustom[key] ?? null
+          if (JSON.stringify(from) !== JSON.stringify(to)) changes.push({ field: `custom.${key}`, from, to })
+        }
         // `workspaceId` is not among the fields assigned: it is routing, not a field of the asset,
         // and letting a patch carry it means a demo can move a row to a workspace that is not real.
-        Object.assign(asset, rest, { updatedAt: new Date().toISOString() })
+        Object.assign(asset, rest, { custom: nextCustom, updatedAt: new Date().toISOString() })
         if (changes.length) appendHistory(asset, 'updated', { changes })
         return stamp(asset)
       },
@@ -760,8 +1020,234 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
           )
         asset.archivedAt = archiving ? new Date().toISOString() : null
         asset.updatedAt = new Date().toISOString()
-        appendHistory(asset, archiving ? 'retired' : 'restored')
+        // `archived`, which the server wrote as `retired` until 0.5.0 — the word now means a
+        // disposition, and `AssetHistoryEntry` in the contract says why it moved.
+        appendHistory(asset, archiving ? 'archived' : 'restored')
         return stamp(asset)
+      },
+
+      /**
+       * The two things somebody says about an item that nothing else records, and the one way
+       * back — with the server's refusals, because the dialog's error toast is half of the feature
+       * and a demo that cannot show "take it back before retiring it" cannot show that.
+       */
+      markLost: async ({
+        workspaceId,
+        assetId: id,
+        note,
+      }: {
+        workspaceId: string
+        assetId: string
+        note?: string | null
+      }) => {
+        remember(workspaceId)
+        // Allowed while somebody holds it, and while it is away for repair: a repairer can lose a
+        // thing, and Ada's lost laptop is still Ada's until somebody takes it back.
+        return dispose(inService(id), 'lost', note)
+      },
+
+      retire: async ({
+        workspaceId,
+        assetId: id,
+        note,
+      }: {
+        workspaceId: string
+        assetId: string
+        note?: string | null
+      }) => {
+        remember(workspaceId)
+        const asset = inService(id)
+        // The same two refusals as `archive`, for the same reasons: somebody holding it is still
+        // answerable, and an open repair is money committed and a thing out of the building.
+        if (asset.custodianUserId)
+          throw new MockApiError(
+            'CONFLICT',
+            'Somebody is still holding this item. Take it back before retiring it.',
+            'inventory.asset.still_held',
+          )
+        if (openRepairFor(id))
+          throw new MockApiError(
+            'CONFLICT',
+            'This item is away for repair. Log the repair as returned before retiring it.',
+            'inventory.asset.under_repair',
+          )
+        return dispose(asset, 'retired', note)
+      },
+
+      reinstate: async ({
+        workspaceId,
+        assetId: id,
+        note,
+      }: {
+        workspaceId: string
+        assetId: string
+        note?: string | null
+      }) => {
+        remember(workspaceId)
+        const asset = find(id)
+        if (asset.archivedAt)
+          throw new MockApiError(
+            'CONFLICT',
+            'This item is archived. Restore it before changing what happened to it.',
+            'inventory.asset.archived',
+          )
+        const from = asset.disposition
+        if (!from)
+          throw new MockApiError(
+            'CONFLICT',
+            'This item is in service already; there is nothing to reinstate.',
+            'inventory.asset.not_disposed',
+          )
+        // Nothing but the disposition moves: custody and the open repair are exactly as they were,
+        // so `restamp` hands the status back to them and a laptop found under a desk reads
+        // `assigned` again with no handover re-recorded.
+        asset.disposition = null
+        asset.dispositionAt = null
+        restamp(asset)
+        appendHistory(asset, 'reinstated', { data: { from, ...(note ? { note } : {}) } })
+        return stamp(asset)
+      },
+    },
+
+    /**
+     * The workspace's own fields, shaped like categories because they are the same kind of thing:
+     * a named row in an ordered list, archived rather than deleted, the sequence rewritten whole by
+     * `reorder`. The refusals are the server's, so the settings screen can be shown failing the
+     * way it really fails.
+     */
+    fields: {
+      list: async ({ workspaceId, archived = false }: { workspaceId: string; archived?: boolean }) => {
+        remember(workspaceId)
+        return fields
+          .filter((row) => (archived ? true : !row.archivedAt))
+          .sort((a, b) => a.order - b.order || a.name.localeCompare(b.name))
+          .map(stamp)
+      },
+
+      create: async ({
+        workspaceId,
+        key,
+        type,
+        name,
+        description,
+        categoryId: forCategory,
+        options,
+        required,
+      }: {
+        workspaceId: string
+        key: string
+        type: FieldType
+        name: string
+        description?: string | null
+        categoryId?: string | null
+        options?: string[]
+        required?: boolean
+      }) => {
+        remember(workspaceId)
+        const choices = checkOptions(type, options)
+        roomForOneMoreField()
+        // The server's unique index on (workspace, key) answers a duplicate with a sentence; so
+        // does this. Archived rows count, because the key is what a value is stored under.
+        if (fields.some((row) => row.key === key))
+          throw new MockApiError(
+            'CONFLICT',
+            `This workspace already has a field with the key “${key}”.`,
+            'inventory.field.key_taken',
+          )
+        if (forCategory) findCategory(forCategory)
+        const now = new Date().toISOString()
+        const field: FieldDef = {
+          id: fieldId(),
+          workspaceId: '' as Asset['workspaceId'],
+          categoryId: forCategory ?? null,
+          key,
+          name,
+          description: description ?? null,
+          type,
+          options: choices,
+          required: required ?? false,
+          order: appendedFieldOrder(),
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+        }
+        fields.push(field)
+        return stamp(field)
+      },
+
+      update: async ({
+        workspaceId,
+        fieldId: id,
+        ...patch
+      }: {
+        workspaceId?: string
+        fieldId: string
+        name?: string
+        description?: string | null
+        categoryId?: string | null
+        options?: string[]
+        required?: boolean
+      }) => {
+        remember(workspaceId)
+        const field = findField(id)
+        // Everything but the key and the type. `undefined` means "not mentioned"; `null` on the
+        // two nullable columns means "clear it".
+        if (patch.options !== undefined) field.options = checkOptions(field.type, patch.options)
+        if (patch.name !== undefined) field.name = patch.name
+        if (patch.description !== undefined) field.description = patch.description ?? null
+        if (patch.categoryId !== undefined) {
+          if (patch.categoryId) findCategory(patch.categoryId)
+          field.categoryId = patch.categoryId ?? null
+        }
+        if (patch.required !== undefined) field.required = patch.required
+        field.updatedAt = new Date().toISOString()
+        return stamp(field)
+      },
+
+      archive: async ({
+        workspaceId,
+        fieldId: id,
+        archived,
+      }: {
+        workspaceId?: string
+        fieldId: string
+        archived?: boolean
+      }) => {
+        remember(workspaceId)
+        const field = findField(id)
+        const restoring = archived === false
+        // A restore needs room, exactly as a create does, and appends for the reason a restored
+        // category does: its old number belongs to somebody else by now.
+        if (restoring) {
+          roomForOneMoreField()
+          field.order = appendedFieldOrder()
+        }
+        field.archivedAt = restoring ? null : new Date().toISOString()
+        field.updatedAt = new Date().toISOString()
+        return stamp(field)
+      },
+
+      reorder: async ({ workspaceId, fieldIds }: { workspaceId?: string; fieldIds: string[] }) => {
+        remember(workspaceId)
+        const named = new Set(fieldIds)
+        if (named.size !== fieldIds.length)
+          throw new MockApiError('BAD_REQUEST', 'That list of fields names the same one more than once.')
+        for (const id of fieldIds) findField(id)
+        const live = fields.filter((row) => !row.archivedAt)
+        if (live.some((row) => !named.has(row.id)) || fieldIds.some((id) => findField(id).archivedAt))
+          throw new MockApiError(
+            'CONFLICT',
+            'The fields changed while this list was open, so this order was not saved. Reload the list and arrange it again.',
+            'inventory.field.order_stale',
+          )
+        const now = new Date().toISOString()
+        for (const [index, id] of fieldIds.entries()) {
+          const field = findField(id)
+          if (field.order === index) continue
+          field.order = index
+          field.updatedAt = now
+        }
+        return fieldIds.map((id) => stamp(findField(id)))
       },
     },
 
@@ -946,7 +1432,7 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
         note?: string | null
       }) => {
         remember(workspaceId)
-        const asset = liveAsset(id)
+        const asset = givable(liveAsset(id))
         const open = openPeriodFor(id)
         if (open)
           throw new MockApiError(
@@ -989,7 +1475,7 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
         note?: string | null
       }) => {
         remember(workspaceId)
-        const asset = liveAsset(id)
+        const asset = givable(liveAsset(id))
         const open = openPeriodFor(id)
         if (!open)
           throw new MockApiError(
@@ -1130,6 +1616,16 @@ export function createMockInventoryApi(options: MockInventoryOptions = {}) {
             'CONFLICT',
             'This item is archived. Restore it before sending it for repair.',
             'inventory.repair.archived',
+          )
+        // Nor a lost or retired one: nobody can send away a thing nobody can find, and paying to
+        // fix something the company has written off is a mistake worth naming.
+        if (asset.disposition)
+          throw new MockApiError(
+            'CONFLICT',
+            asset.disposition === 'lost'
+              ? 'This item is marked lost. Reinstate it before sending it for repair.'
+              : 'This item is retired. Reinstate it before sending it for repair.',
+            'inventory.repair.disposed',
           )
         if (openRepairFor(id))
           throw new MockApiError(

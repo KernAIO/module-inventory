@@ -26,15 +26,17 @@ import {
   toast,
 } from '@kernhq/ui'
 import { createInfiniteQuery, createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query'
-import type { Asset, AssetStatus, Category } from '../../contract/index.js'
+import type { Asset, AssetSort, AssetStatus, Category } from '../../contract/index.js'
 import { getInventoryApi } from '../api-instance.js'
 import { isolated } from '../bidi.js'
 import AssetDetailPanel from '../components/AssetDetailPanel.svelte'
 import AssetFormDialog from '../components/AssetFormDialog.svelte'
+import DispositionDialog from '../components/DispositionDialog.svelte'
 import type { CoreApi, CoreMember } from '../core-api.js'
+import { type DispositionAction, dispositionActions } from '../disposition.js'
 import { errorMessage } from '../errors.js'
 import { t } from '../i18n.js'
-import { ASSET_PARAM } from '../links.js'
+import { ASSET_PARAM, CUSTODIAN_PARAM } from '../links.js'
 import { directory, directoryStatus, nameOf } from '../members.js'
 import { canInventory } from '../permissions.js'
 import { inventoryKeys } from '../query.js'
@@ -62,6 +64,12 @@ const queryClient = useQueryClient()
 let searchText = $state('')
 let statusFilter = $state<string>('')
 let categoryFilter = $state<string>('')
+/**
+ * How the list is ordered. A string rather than an `AssetSort`, because that is what `Select`
+ * binds; it is narrowed where it enters the request, and the only values it can hold are the ones
+ * `sortOptions` offers.
+ */
+let sortChoice = $state<string>('recent')
 let showArchived = $state(false)
 let dialogOpen = $state(false)
 /** The row the dialog is editing, or null when it is adding one. */
@@ -87,14 +95,17 @@ $effect(() => {
  * — it is a SvelteKit alias, and this package is type-checked on its own.
  */
 const params = $derived(new URLSearchParams(navigation.search))
-const custodianFilter = $derived(params.get('custodian') ?? '')
+const custodianFilter = $derived(params.get(CUSTODIAN_PARAM) ?? '')
 
 /**
- * Every filter is part of the key and part of the request.
+ * Every filter is part of the key and part of the request — and so is the sort.
  *
  * Filtering in the browser is only ever right for a list that is entirely loaded, and this one is
  * paged: dropping archived rows client-side returned twenty rows, showed eleven, and made the list
- * look short rather than paged.
+ * look short rather than paged. The sort is in here for a stricter reason: a page cursor is a
+ * bookmark *into one ordering*, and the server refuses a cursor issued under another. Keying the
+ * cache on the sort is what makes changing it start a fresh list rather than hand page two of the
+ * old ordering a marker the new one cannot read.
  */
 const filters = $derived({
   ...(query ? { q: query } : {}),
@@ -102,6 +113,7 @@ const filters = $derived({
   ...(categoryFilter ? { categoryId: categoryFilter } : {}),
   ...(custodianFilter ? { custodianUserId: custodianFilter } : {}),
   archived: showArchived,
+  sort: sortChoice as AssetSort,
 })
 
 /**
@@ -121,7 +133,7 @@ function clearFilters() {
   query = ''
   statusFilter = ''
   categoryFilter = ''
-  setParam('custodian', null)
+  setParam(CUSTODIAN_PARAM, null)
 }
 
 /**
@@ -288,22 +300,32 @@ const countLine = $derived(
 )
 
 /**
- * Every status the contract can hold, offered ahead of the features that set them.
+ * Every status the register can actually produce.
  *
- * Three of the six are written now — `in_stock` and `assigned` by custody, `under_repair` by a
- * repair — and `reserved`, `lost` and `retired` wait on the features that set them, so those three
- * correctly return nothing. That is the data being uniform rather than the filter being broken, and
- * the alternative — hiding options and adding them back one release later — teaches somebody the
- * list is unstable. The README says the same thing in as many words.
+ * Five of the contract's six: `in_stock` and `assigned` are written by custody, `under_repair` by
+ * a repair, and `lost` and `retired` by hand — `assets.markLost` and `assets.retire`. `reserved`
+ * is the one left out, because it waits on reservations and nothing records one: a filter that
+ * can only ever answer with an empty list is a door that will not open, and the status is still
+ * in the enum so that the day something writes it, the badge and its colour are already there.
  */
 const statusOptions: SelectOption[] = [
   { value: '', label: t('filter_all_statuses') },
   { value: 'in_stock', label: t('status_in_stock') },
   { value: 'assigned', label: t('status_assigned') },
-  { value: 'reserved', label: t('status_reserved') },
   { value: 'under_repair', label: t('status_under_repair') },
   { value: 'lost', label: t('status_lost') },
   { value: 'retired', label: t('status_retired') },
+]
+
+/**
+ * The three orderings `AssetSort` names, with `recent` first because it is the contract's default
+ * and what the list opens on. Written as literals rather than built from the enum so that
+ * `messages.test.ts` can see each key is asked for.
+ */
+const sortOptions: SelectOption[] = [
+  { value: 'recent', label: t('sort_recent') },
+  { value: 'name', label: t('sort_name') },
+  { value: 'code', label: t('sort_code') },
 ]
 
 // ---------------------------------------------------------------- row actions
@@ -372,9 +394,27 @@ function openEdit(asset: Asset) {
 }
 
 /**
+ * The row whose fate is being decided, and which of the three verbs was chosen. Both null when
+ * the dialog is closed; `DispositionDialog` states what happens and takes the note.
+ */
+let disposing = $state<Asset | null>(null)
+let dispositionAction = $state<DispositionAction | null>(null)
+
+function openDisposition(asset: Asset, action: DispositionAction) {
+  disposing = asset
+  dispositionAction = action
+}
+
+/**
  * Restoring is not destructive and needs no confirmation; archiving is, and states what happens.
  * Hidden rather than disabled for somebody without `manage`: they may never do it, so the menu is
  * not there at all rather than being a door that will not open.
+ *
+ * What happened to the item sits between *Edit* and *Archive*: marking it lost is an ordinary
+ * statement and goes with the ordinary items; retiring it is the write-off, wears the danger
+ * colour and sits with archiving, after the separator, because those are the two things that
+ * take an item out of use. A disposed row offers *Reinstate* in place of both — `dispositionActions`
+ * decides, and the panel reads the same answer.
  */
 function actionsFor(asset: Asset): MenuItem[] {
   const items: MenuItem[] = [
@@ -385,15 +425,31 @@ function actionsFor(asset: Asset): MenuItem[] {
   ]
   if (asset.archivedAt) {
     items.push({ label: t('restore'), icon: 'rotate-ccw', onSelect: () => restore(asset) })
-  } else {
-    items.push({ type: 'separator' })
-    items.push({
-      label: t('common.archive'),
-      icon: 'archive',
-      danger: true,
-      onSelect: () => (archiving = asset),
-    })
+    return items
   }
+  const fate = dispositionActions({ disposition: asset.disposition, archived: false, may: true })
+  if (fate.includes('reinstate'))
+    items.push({
+      label: t('reinstate'),
+      icon: 'refresh-cw',
+      onSelect: () => openDisposition(asset, 'reinstate'),
+    })
+  if (fate.includes('lost'))
+    items.push({ label: t('mark_lost'), icon: 'circle-help', onSelect: () => openDisposition(asset, 'lost') })
+  items.push({ type: 'separator' })
+  if (fate.includes('retire'))
+    items.push({
+      label: t('retire'),
+      icon: 'circle-x',
+      danger: true,
+      onSelect: () => openDisposition(asset, 'retire'),
+    })
+  items.push({
+    label: t('common.archive'),
+    icon: 'archive',
+    danger: true,
+    onSelect: () => (archiving = asset),
+  })
   return items
 }
 
@@ -426,6 +482,7 @@ const SKELETON_ROWS = [0, 1, 2, 3, 4, 5]
       ariaLabel={t('category')}
     />
     <Select bind:value={statusFilter} options={statusOptions} size="sm" ariaLabel={t('status')} />
+    <Select bind:value={sortChoice} options={sortOptions} size="sm" ariaLabel={t('sort')} />
     {#if canManage}
       <Button size="sm" icon="plus" onclick={openCreate}>{t('new')}</Button>
     {/if}
@@ -442,7 +499,7 @@ const SKELETON_ROWS = [0, 1, 2, 3, 4, 5]
   {#if custodianFilter}
     <div class="held-by">
       <span>{t('held_by', isolated({ name: custodianName ?? '' }))}</span>
-      <Button size="sm" variant="ghost" onclick={() => setParam('custodian', null)}>
+      <Button size="sm" variant="ghost" onclick={() => setParam(CUSTODIAN_PARAM, null)}>
         {t('held_by_clear')}
       </Button>
     </div>
@@ -604,6 +661,17 @@ const SKELETON_ROWS = [0, 1, 2, 3, 4, 5]
   assetId={openAssetId}
   onclose={() => setAsset(null)}
   onedit={(asset) => openEdit(asset)}
+/>
+
+<!-- Lost, retired, and the way back. One dialog, and the list's own so the panel can share it. -->
+<DispositionDialog
+  {workspaceId}
+  asset={dispositionAction ? disposing : null}
+  action={dispositionAction}
+  onclose={() => {
+    disposing = null
+    dispositionAction = null
+  }}
 />
 
 <!-- Archiving states what happens and to what, rather than asking "Are you sure?". -->

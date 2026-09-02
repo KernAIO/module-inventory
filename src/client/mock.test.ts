@@ -47,8 +47,9 @@ describe('mock assets.list', () => {
   it('opens on what was added last, like the server’s default sort', async () => {
     const api = createMockInventoryApi()
     const { items } = await api.assets.list({ workspaceId: WS })
-    // INV-0006 is archived and therefore absent; the rest are newest first.
-    expect(codes(items)).toEqual(['INV-0005', 'INV-0004', 'INV-0003', 'INV-0002', 'INV-0001'])
+    // INV-0007 is archived and therefore absent; the rest are newest first — the retired
+    // INV-0006 included, because retiring says what happened to it and archiving is a second step.
+    expect(codes(items)).toEqual(['INV-0006', 'INV-0005', 'INV-0004', 'INV-0003', 'INV-0002', 'INV-0001'])
   })
 
   it('honours sort=code and sort=name, which it used to ignore', async () => {
@@ -59,6 +60,7 @@ describe('mock assets.list', () => {
       'INV-0003',
       'INV-0004',
       'INV-0005',
+      'INV-0006',
     ])
     const byName = (await api.assets.list({ workspaceId: WS, sort: 'name' })).items
     expect(byName.map((a) => a.name)).toEqual([...byName.map((a) => a.name)].sort())
@@ -66,7 +68,7 @@ describe('mock assets.list', () => {
 
   it('honours the archived and status filters', async () => {
     const api = createMockInventoryApi()
-    expect(codes((await api.assets.list({ workspaceId: WS, archived: true })).items)).toContain('INV-0006')
+    expect(codes((await api.assets.list({ workspaceId: WS, archived: true })).items)).toContain('INV-0007')
     const assigned = await api.assets.list({ workspaceId: WS, status: 'assigned' })
     expect(assigned.items.every((a) => a.status === 'assigned')).toBe(true)
     expect(assigned.items).toHaveLength(2)
@@ -96,14 +98,14 @@ describe('mock assets.list', () => {
       if (!page.nextCursor) break
       cursor = page.nextCursor
     }
-    expect(seen).toEqual(['INV-0005', 'INV-0004', 'INV-0003', 'INV-0002', 'INV-0001'])
+    expect(seen).toEqual(['INV-0006', 'INV-0005', 'INV-0004', 'INV-0003', 'INV-0002', 'INV-0001'])
     expect(new Set(seen).size).toBe(seen.length)
   })
 
   it('reports no next page when the last page is exactly full', async () => {
     const api = createMockInventoryApi()
-    const page = await api.assets.list({ workspaceId: WS, limit: 5 })
-    expect(page.items).toHaveLength(5)
+    const page = await api.assets.list({ workspaceId: WS, limit: 6 })
+    expect(page.items).toHaveLength(6)
     expect(page.nextCursor).toBe(null)
   })
 
@@ -149,8 +151,26 @@ describe('mock assets.create', () => {
   it('continues the tag sequence from the seeds', async () => {
     const api = createMockInventoryApi()
     // It issued INV-0013 here: one counter was numbering both the ids and the tags.
-    expect((await api.assets.create({ workspaceId: WS, name: 'Standing desk' })).code).toBe('INV-0007')
-    expect((await api.assets.create({ workspaceId: WS, name: 'Label printer' })).code).toBe('INV-0008')
+    expect((await api.assets.create({ workspaceId: WS, name: 'Standing desk' })).code).toBe('INV-0008')
+    expect((await api.assets.create({ workspaceId: WS, name: 'Label printer' })).code).toBe('INV-0009')
+  })
+
+  it('checks custom values against the workspace’s fields, and refuses a key nothing defines', async () => {
+    const api = createMockInventoryApi()
+    const made = await api.assets.create({
+      workspaceId: WS,
+      name: 'Standing desk',
+      custom: { cost_centre: 'Finance' },
+    })
+    expect(made.custom).toEqual({ cost_centre: 'Finance' })
+    await expect(
+      api.assets.create({ workspaceId: WS, name: 'Nope', custom: { colour: 'red' } }),
+    ).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+      data: { reason: 'inventory.field.unknown', field: 'colour' },
+    })
+    // The refusal wrote nothing.
+    expect((await api.assets.list({ workspaceId: WS })).items.map((a) => a.name)).not.toContain('Nope')
   })
 
   it('puts what was just created at the top of the default list', async () => {
@@ -174,6 +194,44 @@ describe('mock assets.update and archive', () => {
     expect(updated.code).toBe(first?.code)
     // Routing, not a field of the asset: a patch must not be able to move a row between workspaces.
     expect(updated.workspaceId).toBe(first?.workspaceId)
+  })
+
+  /**
+   * A patch to `custom` merges, exactly as the server's does: a form that only rendered the fields
+   * for its category cannot wipe a value it never saw, and `null` under a key is the one way to
+   * clear it. The timeline gets one `custom.<key>` line per key that moved.
+   */
+  it('merges custom values, clears one with null, and records each key that moved', async () => {
+    const api = createMockInventoryApi()
+    const first = (await api.assets.list({ workspaceId: WS, sort: 'code' })).items[0] as {
+      id: string
+      custom: Record<string, unknown>
+    }
+    expect(first.custom).toEqual({ cost_centre: 'Engineering', mac_address: 'A4:83:E7:12:9B:C0' })
+
+    const moved = await api.assets.update({
+      workspaceId: WS,
+      assetId: first.id,
+      custom: { cost_centre: 'Finance' },
+    })
+    expect(moved.custom).toEqual({ cost_centre: 'Finance', mac_address: 'A4:83:E7:12:9B:C0' })
+
+    const cleared = await api.assets.update({
+      workspaceId: WS,
+      assetId: first.id,
+      custom: { mac_address: null },
+    })
+    expect(cleared.custom).toEqual({ cost_centre: 'Finance' })
+
+    await expect(
+      api.assets.update({ workspaceId: WS, assetId: first.id, custom: { colour: 'red' } }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST', data: { reason: 'inventory.field.unknown' } })
+
+    const { items } = await api.assets.history({ workspaceId: WS, assetId: first.id, limit: 2 })
+    expect(items.map((e) => e.changes)).toEqual([
+      [{ field: 'custom.mac_address', from: 'A4:83:E7:12:9B:C0', to: null }],
+      [{ field: 'custom.cost_centre', from: 'Engineering', to: 'Finance' }],
+    ])
   })
 
   it('archives and restores the same row', async () => {
@@ -326,7 +384,9 @@ describe('mock categories', () => {
 describe('mock custody', () => {
   const freeAsset = async (api: ReturnType<typeof createMockInventoryApi>) => {
     const { items } = await api.assets.list({ workspaceId: WS })
-    const free = items.find((a) => !a.custodianUserId)
+    // In stock, not merely unheld: a retired item and one at the repairer are both held by nobody,
+    // and neither reads `assigned` after a handover.
+    const free = items.find((a) => a.status === 'in_stock')
     expect(free).toBeTruthy()
     return free as (typeof items)[number]
   }
@@ -547,6 +607,210 @@ describe('mock repairs', () => {
   })
 })
 
+/**
+ * Lost, retired and reinstated, held to the server's rules — which are the interesting part of the
+ * feature. A held item can be lost but not retired; nothing lost or retired can be handed to
+ * anybody or sent for repair, and it can still be taken back; reinstating hands the status back to
+ * custody and repairs rather than to `in_stock`.
+ */
+describe('mock dispositions', () => {
+  const dan = '01920000-0000-7000-8000-000000000002'
+  const byCode = async (api: ReturnType<typeof createMockInventoryApi>, code: string) => {
+    const { items } = await api.assets.list({ workspaceId: WS, archived: true, sort: 'code' })
+    return items.find((a) => a.code === code) as (typeof items)[number]
+  }
+
+  it('seeds one lost and one retired item, in the list and with a date', async () => {
+    const api = createMockInventoryApi()
+    const lost = (await api.assets.list({ workspaceId: WS, status: 'lost' })).items
+    const retired = (await api.assets.list({ workspaceId: WS, status: 'retired' })).items
+    expect(lost.map((a) => a.code)).toEqual(['INV-0005'])
+    expect(retired.map((a) => a.code)).toEqual(['INV-0006'])
+    expect(lost[0]).toMatchObject({ disposition: 'lost', archivedAt: null })
+    expect(lost[0]?.dispositionAt).toBeTruthy()
+    // And the timeline says who said so, the way the server records it.
+    const { items } = await api.assets.history({ workspaceId: WS, assetId: retired[0]?.id as string })
+    expect(items[0]?.action).toBe('written_off')
+  })
+
+  it('marks a held item lost without releasing whoever holds it, and refuses a second time', async () => {
+    const api = createMockInventoryApi()
+    const held = await byCode(api, 'INV-0001')
+    const lost = await api.assets.markLost({ workspaceId: WS, assetId: held.id, note: 'Left on a train' })
+    expect(lost).toMatchObject({ status: 'lost', disposition: 'lost', custodianUserId: dan })
+    await expect(api.assets.markLost({ workspaceId: WS, assetId: held.id })).rejects.toMatchObject({
+      code: 'CONFLICT',
+      data: { reason: 'inventory.asset.already_disposed' },
+    })
+    const { items } = await api.assets.history({ workspaceId: WS, assetId: held.id, limit: 1 })
+    expect(items[0]).toMatchObject({ action: 'lost', data: { note: 'Left on a train' } })
+  })
+
+  it('refuses to retire a held item or one away for repair, exactly as archiving does', async () => {
+    const api = createMockInventoryApi()
+    await expect(
+      api.assets.retire({ workspaceId: WS, assetId: (await byCode(api, 'INV-0001')).id }),
+    ).rejects.toMatchObject({ code: 'CONFLICT', data: { reason: 'inventory.asset.still_held' } })
+    await expect(
+      api.assets.retire({ workspaceId: WS, assetId: (await byCode(api, 'INV-0003')).id }),
+    ).rejects.toMatchObject({ code: 'CONFLICT', data: { reason: 'inventory.asset.under_repair' } })
+    // Free and in the building: allowed.
+    const retired = await api.assets.retire({ workspaceId: WS, assetId: (await byCode(api, 'INV-0002')).id })
+    expect(retired).toMatchObject({ status: 'retired', disposition: 'retired' })
+  })
+
+  it('refuses either disposition on an archived item', async () => {
+    const api = createMockInventoryApi()
+    const archived = await byCode(api, 'INV-0007')
+    await expect(api.assets.markLost({ workspaceId: WS, assetId: archived.id })).rejects.toMatchObject({
+      code: 'CONFLICT',
+      data: { reason: 'inventory.asset.archived' },
+    })
+    await expect(api.assets.reinstate({ workspaceId: WS, assetId: archived.id })).rejects.toMatchObject({
+      code: 'CONFLICT',
+      data: { reason: 'inventory.asset.archived' },
+    })
+  })
+
+  it('lets a lost item be taken back but never handed to anybody, and never sent for repair', async () => {
+    const api = createMockInventoryApi()
+    const lost = await byCode(api, 'INV-0005')
+    await expect(
+      api.custody.assign({ workspaceId: WS, assetId: lost.id, userId: dan }),
+    ).rejects.toMatchObject({ code: 'CONFLICT', data: { reason: 'inventory.custody.disposed' } })
+    await expect(
+      api.repairs.create({ workspaceId: WS, assetId: lost.id, summary: 'Lens' }),
+    ).rejects.toMatchObject({ code: 'CONFLICT', data: { reason: 'inventory.repair.disposed' } })
+
+    // Lose a held one, then take it back: allowed, and the item reads lost throughout.
+    const held = await byCode(api, 'INV-0001')
+    await api.assets.markLost({ workspaceId: WS, assetId: held.id })
+    await expect(
+      api.custody.transfer({
+        workspaceId: WS,
+        assetId: held.id,
+        userId: '01920000-0000-7000-8000-000000000003',
+      }),
+    ).rejects.toMatchObject({ code: 'CONFLICT', data: { reason: 'inventory.custody.disposed' } })
+    const { asset: back } = await api.custody.return({ workspaceId: WS, assetId: held.id })
+    expect(back).toMatchObject({ status: 'lost', custodianUserId: null })
+  })
+
+  it('reinstates to whatever custody and repairs say, and refuses an item in service', async () => {
+    const api = createMockInventoryApi()
+    const held = await byCode(api, 'INV-0001')
+    await api.assets.markLost({ workspaceId: WS, assetId: held.id })
+    const found = await api.assets.reinstate({ workspaceId: WS, assetId: held.id, note: 'Under a desk' })
+    // Back to `assigned`, with no handover re-recorded: Dan never stopped holding it.
+    expect(found).toMatchObject({
+      status: 'assigned',
+      disposition: null,
+      dispositionAt: null,
+      custodianUserId: dan,
+    })
+    const { items } = await api.assets.history({ workspaceId: WS, assetId: held.id, limit: 1 })
+    expect(items[0]).toMatchObject({ action: 'reinstated', data: { from: 'lost', note: 'Under a desk' } })
+    await expect(api.assets.reinstate({ workspaceId: WS, assetId: held.id })).rejects.toMatchObject({
+      code: 'CONFLICT',
+      data: { reason: 'inventory.asset.not_disposed' },
+    })
+    // An item lost at the repairer comes back as `under_repair`, not as in stock.
+    const away = await byCode(api, 'INV-0003')
+    await api.assets.markLost({ workspaceId: WS, assetId: away.id })
+    expect((await api.assets.reinstate({ workspaceId: WS, assetId: away.id })).status).toBe('under_repair')
+  })
+})
+
+/**
+ * The workspace's own fields, shaped like categories and held to the same refusals.
+ */
+describe('mock fields', () => {
+  it('seeds a workspace-wide choice field and a laptops-only text field', async () => {
+    const api = createMockInventoryApi()
+    const live = await api.fields.list({ workspaceId: WS })
+    expect(live.map((f) => f.key)).toEqual(['cost_centre', 'mac_address'])
+    const laptops = (await api.categories.list({ workspaceId: WS })).find((c) => c.name === 'Laptops')
+    expect(live[0]).toMatchObject({
+      type: 'select',
+      categoryId: null,
+      options: ['Engineering', 'Finance', 'Operations'],
+    })
+    expect(live[1]).toMatchObject({ type: 'text', categoryId: laptops?.id, options: [] })
+  })
+
+  it('creates at the end, refuses a duplicate key, and refuses a choice field with no choices', async () => {
+    const api = createMockInventoryApi()
+    const made = await api.fields.create({
+      workspaceId: WS,
+      key: 'supplier_ref',
+      type: 'text',
+      name: 'Supplier ref',
+    })
+    expect((await api.fields.list({ workspaceId: WS })).map((f) => f.key)).toEqual([
+      'cost_centre',
+      'mac_address',
+      'supplier_ref',
+    ])
+    expect(made.order).toBe(2)
+    await expect(
+      api.fields.create({ workspaceId: WS, key: 'cost_centre', type: 'text', name: 'Again' }),
+    ).rejects.toMatchObject({ code: 'CONFLICT', data: { reason: 'inventory.field.key_taken' } })
+    await expect(
+      api.fields.create({ workspaceId: WS, key: 'site', type: 'select', name: 'Site', options: [] }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST', data: { reason: 'inventory.field.no_options' } })
+    await expect(
+      api.fields.create({ workspaceId: WS, key: 'site', type: 'text', name: 'Site', options: ['Berlin'] }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST', data: { reason: 'inventory.field.options_unused' } })
+  })
+
+  it('renames, rescopes, archives and restores without ever deleting', async () => {
+    const api = createMockInventoryApi()
+    const [cost] = await api.fields.list({ workspaceId: WS })
+    const id = cost?.id as string
+    const renamed = await api.fields.update({ workspaceId: WS, fieldId: id, name: 'Budget', required: true })
+    expect(renamed).toMatchObject({ name: 'Budget', required: true, key: 'cost_centre' })
+    await api.fields.archive({ workspaceId: WS, fieldId: id })
+    expect((await api.fields.list({ workspaceId: WS })).map((f) => f.id)).not.toContain(id)
+    expect((await api.fields.list({ workspaceId: WS, archived: true })).map((f) => f.id)).toContain(id)
+    // An archived field is writable by nothing; the value already on an asset stays.
+    const first = (await api.assets.list({ workspaceId: WS, sort: 'code' })).items[0] as { id: string }
+    await expect(
+      api.assets.update({ workspaceId: WS, assetId: first.id, custom: { cost_centre: 'Finance' } }),
+    ).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+      data: { reason: 'inventory.field.archived', field: 'Budget' },
+    })
+    expect((await api.assets.get({ workspaceId: WS, assetId: first.id })).custom).toMatchObject({
+      cost_centre: 'Engineering',
+    })
+    // Restored at the end, not back on its old number.
+    await api.fields.archive({ workspaceId: WS, fieldId: id, archived: false })
+    expect((await api.fields.list({ workspaceId: WS })).map((f) => f.key)).toEqual([
+      'mac_address',
+      'cost_centre',
+    ])
+  })
+
+  it('reorders the sequence, and refuses a list that no longer describes the workspace', async () => {
+    const api = createMockInventoryApi()
+    const ids = (await api.fields.list({ workspaceId: WS })).map((f) => f.id)
+    const moved = await api.fields.reorder({
+      workspaceId: WS,
+      fieldIds: [ids[1] as string, ids[0] as string],
+    })
+    expect(moved.map((f) => f.key)).toEqual(['mac_address', 'cost_centre'])
+    await expect(api.fields.reorder({ workspaceId: WS, fieldIds: [ids[0] as string] })).rejects.toMatchObject(
+      {
+        code: 'CONFLICT',
+        data: { reason: 'inventory.field.order_stale' },
+      },
+    )
+    await expect(
+      api.fields.reorder({ workspaceId: WS, fieldIds: [...ids, '01920000-0000-7000-8000-0000000000ff'] }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' })
+  })
+})
+
 describe('mock attachments', () => {
   it('keeps a repair’s paperwork under the repair and the rest under the asset', async () => {
     const api = createMockInventoryApi()
@@ -587,8 +851,8 @@ describe('mock stats.summary', () => {
   it('counts live rows, keeps archived ones beside them, and zero-fills every status', async () => {
     const api = createMockInventoryApi()
     const stats = await api.stats.summary({ workspaceId: WS })
-    // Five live seeds and one archived — the same split the default list shows.
-    expect({ total: stats.total, archived: stats.archived }).toEqual({ total: 5, archived: 1 })
+    // Six live seeds and one archived — the same split the default list shows.
+    expect({ total: stats.total, archived: stats.archived }).toEqual({ total: 6, archived: 1 })
     expect(Object.keys(stats.byStatus).sort()).toEqual([
       'assigned',
       'in_stock',
@@ -597,7 +861,12 @@ describe('mock stats.summary', () => {
       'retired',
       'under_repair',
     ])
-    expect(stats.byStatus.lost).toBe(0)
+    // One of each disposition is seeded, and nothing writes `reserved`.
+    expect({
+      lost: stats.byStatus.lost,
+      retired: stats.byStatus.retired,
+      reserved: stats.byStatus.reserved,
+    }).toEqual({ lost: 1, retired: 1, reserved: 0 })
   })
 
   it('agrees with the status column about what is away', async () => {

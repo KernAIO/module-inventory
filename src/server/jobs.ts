@@ -96,11 +96,14 @@ async function forEachWorkspace(
 }
 
 /**
- * The three statuses this module derives, and therefore the only three it may overwrite.
+ * The three statuses this module derives from its own rows, and therefore the only three it may
+ * overwrite.
  *
- * `reserved`, `lost` and `retired` are set by hand by features that do not exist yet — nothing
- * writes them today — and a reconciliation that stamped over one would silently undo somebody's
- * decision. `deriveStatus` says the same thing from the other side.
+ * `lost` and `retired` are what somebody said, kept in `assets.disposition`, and a reconciliation
+ * that stamped over one would silently undo their decision — so a row carrying either is outside
+ * this sweep entirely. The `case` below still reads the column first, so a row that somehow held a
+ * disposition and a derived status would be put right rather than argued with. `reserved` is set by
+ * nothing. `deriveStatus` says the same thing from the other side.
  */
 const DERIVED_STATUSES = ['in_stock', 'assigned', 'under_repair'] as const
 
@@ -145,6 +148,7 @@ export async function reconcileStatuses(
                      and ${repairs.returnedOn} is null)`
     : sql`false`
   const derived = sql`case
+      when ${assets.disposition} in ('lost', 'retired') then ${assets.disposition}
       when ${away} then 'under_repair'
       when ${assets.custodianUserId} is not null then 'assigned'
       else 'in_stock' end`

@@ -4,7 +4,7 @@ import type { CustodyPeriod as CustodyPeriodModel } from '../../contract/models.
 import { assets, custodyPeriods } from '../schema.js'
 import { violated } from './db-errors.js'
 import type { HistoryInput, NotifyService } from './notify.js'
-import { awayForRepair, deriveStatus, lockAsset } from './status.js'
+import { awayForRepair, deriveStatus, dispositionOf, lockAsset } from './status.js'
 
 type AssetRow = typeof assets.$inferSelect
 type PeriodRow = typeof custodyPeriods.$inferSelect
@@ -259,9 +259,23 @@ export class CustodyService {
         'This item is archived. Restore it before handing it over.',
         'inventory.custody.archived',
       )
+    /**
+     * Nor can a lost or retired item be *given* to anybody — handing over a thing nobody can find
+     * is a handover nobody performed, and a retired one is out of service. A *return* is allowed
+     * through, deliberately: the person answerable for a lost laptop has to be able to stop being
+     * answerable for it, which is the honest end of that story.
+     */
+    if (userId !== null && dispositionOf(locked))
+      throw KernError.conflict(
+        locked.disposition === 'lost'
+          ? 'This item is marked lost. Reinstate it before handing it over.'
+          : 'This item is retired. Reinstate it before handing it over.',
+        'inventory.custody.disposed',
+      )
     const status = deriveStatus({
       custodianUserId: userId,
       awayForRepair: await awayForRepair(tx, workspaceId, assetId, repairsOn),
+      disposition: dispositionOf(locked),
     })
     const [row] = await tx
       .update(assets)

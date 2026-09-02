@@ -1,6 +1,6 @@
 import { KernError, type Tx } from '@kernhq/kernel'
 import { and, eq, isNull } from 'drizzle-orm'
-import type { AssetStatus } from '../../contract/models.js'
+import type { AssetStatus, Disposition } from '../../contract/models.js'
 import { assets, repairs } from '../schema.js'
 
 /**
@@ -32,11 +32,15 @@ import { assets, repairs } from '../schema.js'
  * - **Completing a repair does not blindly go to `in_stock`.** It goes back to whatever custody
  *   says — `assigned` when somebody still holds it — because the repair never released them.
  *
- * `reserved`, `lost` and `retired` are not derivable from anything this module records: they are set
- * by hand by the features that will own them, and nothing writes them today. When something does,
- * it either belongs in this function with a fact of its own or it does not belong in this column.
+ * **A disposition wins over both.** `lost` and `retired` are not derivable from anything else this
+ * module records — they are things a person said, kept in `assets.disposition` — and they are a
+ * fact this function reads *first*, because the alternative is a status that says `assigned` about
+ * a laptop nobody can find. Custody is untouched by either: Ada's lost laptop is still Ada's until
+ * somebody takes it back, and `assets.reinstate` clears the disposition and hands the column back to
+ * the other two facts, so a laptop found under a desk reads `assigned` again with no handover
+ * re-recorded. `reserved` is still nothing: it waits on reservations, and nothing writes it.
  *
- * ## The third fact, which is not about the item at all
+ * ## The fourth fact, which is not about the item at all
  *
  * **`under_repair` belongs to the `repairs` capability, so a workspace that has switched repairs
  * off never has an asset in it.** That is not cosmetic tidying, it is the thing that stopped an
@@ -57,12 +61,19 @@ export interface StatusFacts {
   custodianUserId: string | null
   /** An **open repair this workspace is recording** — see `awayForRepair` below. */
   awayForRepair: boolean
+  /** `assets.disposition` — what somebody said happened to it, or null while it is in service. */
+  disposition: Disposition | null
 }
 
 export function deriveStatus(facts: StatusFacts): AssetStatus {
+  if (facts.disposition) return facts.disposition
   if (facts.awayForRepair) return 'under_repair'
   return facts.custodianUserId ? 'assigned' : 'in_stock'
 }
+
+/** `assets.disposition` as the contract types it; the column is text and this is the one cast. */
+export const dispositionOf = (row: { disposition: string | null }): Disposition | null =>
+  row.disposition === 'lost' || row.disposition === 'retired' ? row.disposition : null
 
 /**
  * Is this item away for a repair the workspace still records?

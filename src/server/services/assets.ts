@@ -7,12 +7,14 @@ import type {
   Asset as AssetModel,
   AssetPatchInput,
   AssetSort,
+  Disposition,
 } from '../../contract/models.js'
 import { InventorySettings } from '../../contract/settings.js'
 import { assetHistory, assets, categories, counters } from '../schema.js'
 import { decodeMark, decodeSeqMark, encodeMark, encodeSeqMark } from './cursor.js'
+import type { FieldService } from './fields.js'
 import type { HistoryInput, NotifyService } from './notify.js'
-import { openRepairId } from './status.js'
+import { awayForRepair, deriveStatus, dispositionOf, lockAsset, openRepairId } from './status.js'
 
 type Row = typeof assets.$inferSelect
 
@@ -49,6 +51,8 @@ export function toAsset(row: Row): AssetModel {
     status: row.status as AssetModel['status'],
     custodianUserId: row.custodianUserId,
     custodySince: row.custodySince?.toISOString() ?? null,
+    disposition: dispositionOf(row),
+    dispositionAt: row.dispositionAt?.toISOString() ?? null,
     serialNumber: row.serialNumber,
     location: row.location,
     purchasedOn: row.purchasedOn ?? null,
@@ -115,10 +119,17 @@ export interface ListInput {
   sort: AssetSort
 }
 
+/** What a disposition wrote: the row, its history entry, and which disposition — for the event. */
+export interface Disposed extends Written {
+  activity: HistoryInput
+  disposition: Disposition
+}
+
 export class AssetService {
   constructor(
     private readonly kernel: Kernel,
     private readonly notify: NotifyService,
+    private readonly fields: FieldService,
   ) {}
 
   /**
@@ -334,6 +345,15 @@ export class AssetService {
     format: CodeFormat,
   ): Promise<Written> {
     if (input.categoryId) await this.requireCategory(tx, workspaceId, input.categoryId)
+    // Every custom value is checked against the workspace's field definitions before the row is
+    // written, and a required field the category asks for has to arrive. `FieldService.apply` is
+    // the one place those rules live.
+    const custom = await this.fields.apply(tx, workspaceId, {
+      current: {},
+      patch: input.custom,
+      categoryId: input.categoryId ?? null,
+      creating: true,
+    })
     const [row] = await tx
       .insert(assets)
       .values({
@@ -351,6 +371,7 @@ export class AssetService {
         priceMinor: input.priceMinor ?? null,
         currency: input.currency ?? null,
         photoFileId: input.photoFileId ?? null,
+        custom,
       })
       .returning()
     const activity: HistoryInput = { workspaceId, assetId: row!.id, actorId, action: 'created' }
@@ -410,6 +431,23 @@ export class AssetService {
      */
     if (patch.warrantyUntil !== prev.warrantyUntil) patch.warrantyNotifiedAt = null
 
+    /**
+     * The custom values, merged and checked under the same lock.
+     *
+     * Against the category the asset is *moving to* when the patch moves it, because that is what
+     * decides which required fields apply. A patch that mentions no custom key still goes through
+     * `apply`, which then only checks that nothing required has gone missing — and nothing can
+     * have, since the merge left every key where it was.
+     */
+    const previousCustom = prev.custom ?? {}
+    const nextCustom = await this.fields.apply(tx, workspaceId, {
+      current: previousCustom,
+      patch: input.custom,
+      categoryId: patch.categoryId as string | null,
+      creating: false,
+    })
+    patch.custom = nextCustom
+
     // Filtered by workspace as well as by id. The `select … for update` three statements up already
     // carries the predicate, so this is not reachable today — but `core` connects as a superuser
     // with RLS bypassed, which makes the predicate in the statement the only barrier there is. A
@@ -421,11 +459,19 @@ export class AssetService {
       .returning()
 
     const iso = (v: unknown) => (v instanceof Date ? v.toISOString() : v) ?? null
-    const changes = AssetService.EDITABLE.filter((f) => iso(patch[f]) !== iso(prev[f])).map((f) => ({
-      field: f,
-      from: iso(prev[f]),
-      to: iso(patch[f]),
-    }))
+    const changes: Array<{ field: string; from: unknown; to: unknown }> = AssetService.EDITABLE.filter(
+      (f) => iso(patch[f]) !== iso(prev[f]),
+    ).map((f) => ({ field: f, from: iso(prev[f]), to: iso(patch[f]) }))
+    /**
+     * One diff line per custom key that moved, named `custom.<key>` so the timeline can look the
+     * field's name up and say «Cost centre changed from 4100 to 4200» rather than printing the key.
+     * Compared as JSON because a multiselect is an array and two equal arrays are not `===`.
+     */
+    for (const key of new Set([...Object.keys(previousCustom), ...Object.keys(nextCustom)])) {
+      const from = previousCustom[key] ?? null
+      const to = nextCustom[key] ?? null
+      if (JSON.stringify(from) !== JSON.stringify(to)) changes.push({ field: `custom.${key}`, from, to })
+    }
     if (changes.length === 0) return { row: row!, activity: null }
 
     const activity: HistoryInput = { workspaceId, assetId, actorId, action: 'updated', changes }
@@ -516,13 +562,173 @@ export class AssetService {
       .where(and(eq(assets.workspaceId, workspaceId), eq(assets.id, assetId)))
       .returning()
     if (!row) throw KernError.notFound('Asset')
+    // `archived`, which was `retired` until 0.5.0 — `AssetHistoryEntry` in the contract says why
+    // the word moved, and the client reads both as the same sentence.
     const activity: HistoryInput = {
       workspaceId,
       assetId,
       actorId,
-      action: archived ? 'retired' : 'restored',
+      action: archived ? 'archived' : 'restored',
     }
     await this.notify.history(tx, activity)
     return { row, activity }
+  }
+
+  /**
+   * Nobody knows where it is.
+   *
+   * Allowed while somebody is holding it, and that is the point: Ada's lost laptop is still Ada's
+   * until somebody takes it back, and the register has to be able to say both things at once. The
+   * custody period is untouched; only the disposition is written, and `status` follows it.
+   *
+   * Allowed while it is away for repair too — a repairer can lose a thing — and for the same
+   * reason: the repair row stays open, because nothing came back, and the disposition wins the
+   * status column until somebody says otherwise.
+   */
+  async markLost(
+    tx: Tx,
+    workspaceId: string,
+    actorId: string | null,
+    assetId: string,
+    note: string | null,
+    repairsOn: boolean,
+  ): Promise<Disposed> {
+    const locked = await lockAsset(tx, workspaceId, assetId)
+    AssetService.requireInService(locked)
+    return this.dispose(tx, workspaceId, actorId, locked, 'lost', 'lost', note, repairsOn)
+  }
+
+  /**
+   * The company is done with it: sold, scrapped, written off.
+   *
+   * Refuses the same two things `archive` refuses, for the same reasons — somebody holding it is
+   * still answerable, and an open repair is money committed and a thing out of the building. Both
+   * have to be settled by the procedure that owns them, so the timeline shows who took it back and
+   * what came back, rather than a write-off that quietly resolved both.
+   */
+  async retire(
+    tx: Tx,
+    workspaceId: string,
+    actorId: string | null,
+    assetId: string,
+    note: string | null,
+    repairsOn: boolean,
+  ): Promise<Disposed> {
+    const locked = await lockAsset(tx, workspaceId, assetId)
+    AssetService.requireInService(locked)
+    if (locked.custodianUserId)
+      throw KernError.conflict(
+        'Somebody is still holding this item. Take it back before retiring it.',
+        'inventory.asset.still_held',
+      )
+    if (repairsOn && (await openRepairId(tx, workspaceId, assetId)))
+      throw KernError.conflict(
+        'This item is away for repair. Log the repair as returned before retiring it.',
+        'inventory.asset.under_repair',
+      )
+    return this.dispose(tx, workspaceId, actorId, locked, 'retired', 'written_off', note, repairsOn)
+  }
+
+  /**
+   * It turned up, or the write-off was a mistake.
+   *
+   * Writes nothing but `disposition = null` and the status that follows from the other facts —
+   * custody and the open repair are exactly as they were, so a laptop found under a desk reads
+   * `assigned` again with no handover re-recorded, and one found at the repairer reads
+   * `under_repair`. Refuses an item that has nothing to clear, because "reinstated" in a timeline
+   * has to mean something happened.
+   */
+  async reinstate(
+    tx: Tx,
+    workspaceId: string,
+    actorId: string | null,
+    assetId: string,
+    note: string | null,
+    repairsOn: boolean,
+  ): Promise<Disposed> {
+    const locked = await lockAsset(tx, workspaceId, assetId)
+    if (locked.archivedAt) throw AssetService.archivedRefusal()
+    const from = dispositionOf(locked)
+    if (!from)
+      throw KernError.conflict(
+        'This item is in service already; there is nothing to reinstate.',
+        'inventory.asset.not_disposed',
+      )
+    const status = deriveStatus({
+      custodianUserId: locked.custodianUserId,
+      awayForRepair: await awayForRepair(tx, workspaceId, assetId, repairsOn),
+      disposition: null,
+    })
+    const [row] = await tx
+      .update(assets)
+      .set({ disposition: null, dispositionAt: null, status, updatedAt: new Date() })
+      .where(and(eq(assets.workspaceId, workspaceId), eq(assets.id, assetId)))
+      .returning()
+    if (!row) throw KernError.notFound('Asset')
+    const activity: HistoryInput = {
+      workspaceId,
+      assetId,
+      actorId,
+      action: 'reinstated',
+      data: { from, ...(note ? { note } : {}) },
+    }
+    await this.notify.history(tx, activity)
+    return { row, activity, disposition: from }
+  }
+
+  /** The write both dispositions share, once their own refusals have been made. */
+  private async dispose(
+    tx: Tx,
+    workspaceId: string,
+    actorId: string | null,
+    locked: Row,
+    disposition: Disposition,
+    action: 'lost' | 'written_off',
+    note: string | null,
+    repairsOn: boolean,
+  ): Promise<Disposed> {
+    // Derived rather than assigned, even though the disposition always wins: one function decides
+    // the column everywhere, and a second way of writing it is the drift `status.ts` exists to stop.
+    const status = deriveStatus({
+      custodianUserId: locked.custodianUserId,
+      awayForRepair: await awayForRepair(tx, workspaceId, locked.id, repairsOn),
+      disposition,
+    })
+    const now = new Date()
+    const [row] = await tx
+      .update(assets)
+      .set({ disposition, dispositionAt: now, status, updatedAt: now })
+      .where(and(eq(assets.workspaceId, workspaceId), eq(assets.id, locked.id)))
+      .returning()
+    if (!row) throw KernError.notFound('Asset')
+    const activity: HistoryInput = {
+      workspaceId,
+      assetId: locked.id,
+      actorId,
+      action,
+      data: note ? { note } : {},
+    }
+    await this.notify.history(tx, activity)
+    return { row, activity, disposition }
+  }
+
+  /** An item can only be lost or retired from service — not from the archive, and not twice. */
+  private static requireInService(row: Row): void {
+    if (row.archivedAt) throw AssetService.archivedRefusal()
+    const current = dispositionOf(row)
+    if (current)
+      throw KernError.conflict(
+        current === 'lost'
+          ? 'This item is already marked lost. Reinstate it first if it turned up.'
+          : 'This item is already retired. Reinstate it first if that was a mistake.',
+        'inventory.asset.already_disposed',
+      )
+  }
+
+  private static archivedRefusal(): KernError {
+    return KernError.conflict(
+      'This item is archived. Restore it before changing what happened to it.',
+      'inventory.asset.archived',
+    )
   }
 }

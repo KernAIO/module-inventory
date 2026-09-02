@@ -12,10 +12,11 @@ import {
 } from '@kernhq/kernel'
 import { implement } from '@orpc/server'
 import { inventoryContract, inventoryEvents, MODULE_ID } from '../contract/index.js'
-import { toAsset, type Written } from './services/assets.js'
+import { type Disposed, toAsset, type Written } from './services/assets.js'
 import { toAttachment } from './services/attachments.js'
 import { toCategory } from './services/categories.js'
 import { type CustodyWritten, toCustodyPeriod } from './services/custody.js'
+import { toFieldDef } from './services/fields.js'
 import { inventoryServices } from './services/index.js'
 import { requireWorkspaceMember } from './services/members.js'
 import { type RepairWritten, toRepair } from './services/repairs.js'
@@ -118,6 +119,32 @@ export function inventoryRouter(kernel: Kernel) {
         actorId,
         exclude: [actorId],
       })
+  }
+
+  /**
+   * A disposition's four, with the one thing `announce` cannot carry: which disposition it was.
+   *
+   * The history row is always written here (a disposition that changed nothing is refused rather
+   * than recorded), so `activity` is never null. The event names the disposition so a subscriber
+   * to `disposed` can tell a loss from a write-off without re-reading the row; `reinstated` names
+   * the one it came back *from*, for the same reason.
+   */
+  const announceDisposition = async (
+    workspaceId: WorkspaceId,
+    written: Disposed,
+    event: typeof inventoryEvents.assetDisposed | typeof inventoryEvents.assetReinstated,
+    actorId: string | null,
+  ) => {
+    const assetId = written.row.id
+    await svc.notify.activity(written.activity)
+    await kernel.emit(
+      event,
+      { assetId, workspaceId, disposition: written.disposition },
+      { workspaceId, actorId: actorId ?? undefined },
+    )
+    await svc.notify.change(workspaceId, 'asset', assetId, 'updated')
+    // The document carries `status`, which just moved.
+    await svc.search.reindex(workspaceId, assetId)
   }
 
   /**
@@ -260,6 +287,113 @@ export function inventoryRouter(kernel: Kernel) {
           const event = input.archived ? inventoryEvents.assetArchived : inventoryEvents.assetRestored
           await announce(input.workspaceId, written, event, 'updated', actorId)
           return toAsset(written.row)
+        }),
+
+      /**
+       * The three disposition verbs. Each reads the `repairs` switch first, for the reason
+       * `archive` does — `retire` refuses an item that is away, and a refusal that names a
+       * procedure answering 404 is a dead end — and `deriveStatus` needs the same fact either way.
+       *
+       * `announceDisposition` below carries which disposition it was in the event, so a subscriber
+       * knows whether to open an insurance claim or close a ledger line without re-reading the row.
+       */
+      markLost: scoped.assets.markLost
+        .use(requires('inventory.asset.manage'))
+        .handler(async ({ input, context }) => {
+          const actorId = context.principal.userId
+          const repairsOn = await recordsRepairs(input.workspaceId)
+          const written = await run(context, input.workspaceId, (tx) =>
+            svc.assets.markLost(tx, input.workspaceId, actorId, input.assetId, input.note ?? null, repairsOn),
+          )
+          await announceDisposition(input.workspaceId, written, inventoryEvents.assetDisposed, actorId)
+          return toAsset(written.row)
+        }),
+
+      retire: scoped.assets.retire
+        .use(requires('inventory.asset.manage'))
+        .handler(async ({ input, context }) => {
+          const actorId = context.principal.userId
+          const repairsOn = await recordsRepairs(input.workspaceId)
+          const written = await run(context, input.workspaceId, (tx) =>
+            svc.assets.retire(tx, input.workspaceId, actorId, input.assetId, input.note ?? null, repairsOn),
+          )
+          await announceDisposition(input.workspaceId, written, inventoryEvents.assetDisposed, actorId)
+          return toAsset(written.row)
+        }),
+
+      reinstate: scoped.assets.reinstate
+        .use(requires('inventory.asset.manage'))
+        .handler(async ({ input, context }) => {
+          const actorId = context.principal.userId
+          const repairsOn = await recordsRepairs(input.workspaceId)
+          const written = await run(context, input.workspaceId, (tx) =>
+            svc.assets.reinstate(
+              tx,
+              input.workspaceId,
+              actorId,
+              input.assetId,
+              input.note ?? null,
+              repairsOn,
+            ),
+          )
+          await announceDisposition(input.workspaceId, written, inventoryEvents.assetReinstated, actorId)
+          return toAsset(written.row)
+        }),
+    },
+
+    /**
+     * A workspace's own fields, gated exactly as categories are and for the same reasons: reading
+     * rides `asset.view` because the form and the panel need the definitions to render a value,
+     * and every write is `field.manage`. No kernel event and one realtime change per row that
+     * moved — the same two decisions `categories` makes, argued there.
+     */
+    fields: {
+      list: scoped.fields.list
+        .use(requires('inventory.asset.view'))
+        .handler(({ input, context }) =>
+          run(context, input.workspaceId, async (tx) =>
+            (await svc.fields.list(tx, input.workspaceId, input.archived)).map(toFieldDef),
+          ),
+        ),
+
+      create: scoped.fields.create
+        .use(requires('inventory.field.manage'))
+        .handler(async ({ input, context }) => {
+          const row = await run(context, input.workspaceId, (tx) =>
+            svc.fields.create(tx, input.workspaceId, input),
+          )
+          await svc.notify.change(input.workspaceId, 'field', row.id, 'created')
+          return toFieldDef(row)
+        }),
+
+      update: scoped.fields.update
+        .use(requires('inventory.field.manage'))
+        .handler(async ({ input, context }) => {
+          const row = await run(context, input.workspaceId, (tx) =>
+            svc.fields.update(tx, input.workspaceId, input.fieldId, input),
+          )
+          await svc.notify.change(input.workspaceId, 'field', row.id, 'updated')
+          return toFieldDef(row)
+        }),
+
+      archive: scoped.fields.archive
+        .use(requires('inventory.field.manage'))
+        .handler(async ({ input, context }) => {
+          const row = await run(context, input.workspaceId, (tx) =>
+            svc.fields.archive(tx, input.workspaceId, input.fieldId, input.archived),
+          )
+          await svc.notify.change(input.workspaceId, 'field', row.id, 'updated')
+          return toFieldDef(row)
+        }),
+
+      reorder: scoped.fields.reorder
+        .use(requires('inventory.field.manage'))
+        .handler(async ({ input, context }) => {
+          const { rows, moved } = await run(context, input.workspaceId, (tx) =>
+            svc.fields.reorder(tx, input.workspaceId, input.fieldIds),
+          )
+          for (const id of moved) await svc.notify.change(input.workspaceId, 'field', id, 'updated')
+          return rows.map(toFieldDef)
         }),
     },
 

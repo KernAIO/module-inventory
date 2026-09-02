@@ -1,17 +1,19 @@
 <script lang="ts">
 import {
   Button,
+  Checkbox,
   Dialog,
   Field,
   Input,
   messageLocale,
   Select,
   type SelectOption,
+  Switch,
   Textarea,
   toast,
 } from '@kernhq/ui'
 import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query'
-import type { Asset, Category } from '../../contract/index.js'
+import type { Asset, Category, CustomValues, FieldDef } from '../../contract/index.js'
 import { getInventoryApi } from '../api-instance.js'
 import { isolated } from '../bidi.js'
 import { errorMessage } from '../errors.js'
@@ -59,6 +61,12 @@ let purchasedFrom = $state('')
 let priceText = $state('')
 let currency = $state('')
 let warrantyUntil = $state('')
+/**
+ * The workspace's own fields, keyed by field key, exactly as `assets.custom` holds them — a string
+ * for text, date, url and one choice, a number for a number, a boolean for a checkbox, an array for
+ * several choices. A number being typed is a string until it is sent; `customPatch` converts it.
+ */
+let custom = $state<Record<string, unknown>>({})
 
 /**
  * What the form was last filled from, so opening it on a different row re-seeds it.
@@ -117,6 +125,129 @@ function fill(row: Asset | null) {
   // exactly what this writes only if both halves agree on how many decimal places the money has.
   priceText = formatPrice(row?.priceMinor, messageLocale(), currency || null)
   warrantyUntil = row?.warrantyUntil ?? ''
+  custom = { ...(row?.custom ?? {}) }
+}
+
+/**
+ * The workspace's own fields, live ones only: an archived field is asked on no form.
+ *
+ * `enabled` on `shown` for the reason the categories query is — this dialog is mounted for the
+ * page's whole life — and the answer is usually already cached by the detail panel.
+ */
+const fieldsQuery = createQuery(() => ({
+  queryKey: inventoryKeys.fields(workspaceId),
+  queryFn: () => api.fields.list({ workspaceId }),
+  enabled: Boolean(workspaceId) && shown,
+}))
+
+/**
+ * The fields this asset is asked about: the workspace-wide ones, plus those scoped to the category
+ * **currently chosen in the picker** — so re-filing a laptop as furniture takes the MAC address
+ * question off the form before anybody saves. A value typed under a field that then stops applying
+ * is not sent, and not lost either: `custom` keeps it, and choosing the category back brings it
+ * back with its value.
+ */
+const applicable = $derived<FieldDef[]>(
+  (fieldsQuery.data ?? []).filter(
+    (field: FieldDef) => field.categoryId === null || field.categoryId === categoryId,
+  ),
+)
+
+/** One value as its control holds it: a string for anything typed, a list for several choices. */
+const textOf = (key: string): string => {
+  const value = custom[key]
+  return value === null || value === undefined ? '' : String(value)
+}
+const listOf = (key: string): string[] => {
+  const value = custom[key]
+  return Array.isArray(value) ? value.map(String) : []
+}
+
+function setCustom(key: string, value: unknown) {
+  custom[key] = value
+}
+
+/** Kept in the order the choices are offered, so the stored list reads the way the form does. */
+function toggleChoice(field: FieldDef, option: string, on: boolean) {
+  const chosen = new Set(listOf(field.key))
+  if (on) chosen.add(option)
+  else chosen.delete(option)
+  custom[field.key] = field.options.filter((item) => chosen.has(item))
+}
+
+/**
+ * The choices, plus the value already stored when it is no longer one of them — a choice somebody
+ * renamed keeps the old word on every asset that chose it, and the picker has to be able to show
+ * that word rather than silently showing nothing. The empty row is offered unless the field is
+ * required; a required select with nothing chosen shows the placeholder instead.
+ */
+function choiceOptions(field: FieldDef): SelectOption[] {
+  const current = textOf(field.key)
+  const rows = [...field.options, ...(current && !field.options.includes(current) ? [current] : [])]
+  return [
+    ...(field.required ? [] : [{ value: '', label: '—' }]),
+    ...rows.map((option) => ({ value: option, label: option })),
+  ]
+}
+
+/**
+ * What "nothing here" looks like from each control. A checkbox is never empty — off is an answer —
+ * and it is sent as `false` when required, which is what makes a required checkbox saveable.
+ */
+const isEmpty = (field: FieldDef): boolean => {
+  if (field.type === 'checkbox') return false
+  const value = custom[field.key]
+  if (value === null || value === undefined) return true
+  if (Array.isArray(value)) return value.length === 0
+  return typeof value === 'string' && value.trim() === ''
+}
+
+/**
+ * Required fields still without a value. The server refuses the save too; a form should say so
+ * before the button is pressed rather than after, and keep the button from being pressed.
+ */
+const missing = $derived(applicable.filter((field) => field.required && isEmpty(field)))
+const missingNames = $derived(
+  new Intl.ListFormat(messageLocale(), { style: 'long', type: 'conjunction' }).format(
+    missing.map((field) => field.name),
+  ),
+)
+
+/**
+ * The values to send: only the keys of the fields on this form, `null` for one that was emptied.
+ *
+ * **A patch merges**, so a field that is not on the form — scoped to another category, or archived
+ * — is never mentioned and never touched. `null` is sent only where the asset actually had a value:
+ * clearing a field that was already empty is not a change, and mentioning it would write a diff
+ * line for something that did not happen.
+ */
+function customPatch(): CustomValues {
+  const patch: Record<string, unknown> = {}
+  const before = asset?.custom ?? {}
+  for (const field of applicable) {
+    const raw = custom[field.key]
+    let value: unknown
+    switch (field.type) {
+      case 'number': {
+        const text = textOf(field.key).trim()
+        const parsed = Number(text)
+        value = text === '' || !Number.isFinite(parsed) ? null : parsed
+        break
+      }
+      case 'checkbox':
+        value = raw === undefined ? (field.required ? false : undefined) : raw === true
+        break
+      case 'multiselect':
+        value = listOf(field.key).length ? listOf(field.key) : null
+        break
+      default:
+        value = textOf(field.key).trim() || null
+    }
+    if (value === undefined) continue
+    if (value === null && before[field.key] === undefined) continue
+    patch[field.key] = value
+  }
+  return patch
 }
 
 const close = () => {
@@ -167,6 +298,7 @@ const fields = () => ({
   warrantyUntil: warrantyUntil || null,
   priceMinor: priceResult.ok ? priceResult.minor : null,
   currency: currencyCode,
+  custom: customPatch(),
 })
 
 const save = createMutation(() => ({
@@ -199,7 +331,9 @@ const save = createMutation(() => ({
  * page mid-save. `loading={submitting}` says the same thing to a screen reader through `aria-busy`
  * and moves nothing.
  */
-const canSubmit = $derived(Boolean(name.trim()) && priceResult.ok && canInventory('manage'))
+const canSubmit = $derived(
+  Boolean(name.trim()) && priceResult.ok && missing.length === 0 && canInventory('manage'),
+)
 
 function submit() {
   if (submitting || !canSubmit) return
@@ -285,6 +419,102 @@ function submit() {
         </Field>
       </div>
     </div>
+
+    <!--
+      The workspace's own fields, under the built-in ones and only when at least one applies — a
+      workspace that defines none, or none for this category, sees no heading over nothing.
+      One control per type; the value is read from `custom` and written back by the handler rather
+      than bound, because the keys are only known at render time.
+    -->
+    {#if applicable.length}
+      <h3 class="group-title">{t('custom_fields')}</h3>
+      {#each applicable as field (field.id)}
+        {#if field.type === 'multiselect'}
+          <fieldset class="choices">
+            <legend class="legend">
+              {field.name}{#if field.required}<span class="req" aria-hidden="true">*</span>{/if}
+            </legend>
+            {#if field.description}<p class="msg">{field.description}</p>{/if}
+            <div class="choice-list">
+              {#each field.options as option (option)}
+                <Checkbox
+                  label={option}
+                  checked={listOf(field.key).includes(option)}
+                  onCheckedChange={(on) => toggleChoice(field, option, on)}
+                />
+              {/each}
+            </div>
+          </fieldset>
+        {:else if field.type === 'checkbox'}
+          <Switch
+            label={field.name}
+            description={field.description ?? undefined}
+            checked={custom[field.key] === true}
+            onCheckedChange={(on) => setCustom(field.key, on)}
+          />
+        {:else}
+          <Field
+            label={field.name}
+            id={`inv-custom-${field.key}`}
+            required={field.required}
+            hint={field.description ?? undefined}
+          >
+            {#snippet children(id)}
+              {#if field.type === 'select'}
+                <Select
+                  {id}
+                  value={textOf(field.key)}
+                  options={choiceOptions(field)}
+                  placeholder="—"
+                  ariaLabel={field.name}
+                  onValueChange={(next) => setCustom(field.key, next)}
+                />
+              {:else if field.type === 'number'}
+                <Input
+                  {id}
+                  type="number"
+                  inputmode="decimal"
+                  step="any"
+                  value={textOf(field.key)}
+                  oninput={(event) => setCustom(field.key, event.currentTarget.value)}
+                />
+              {:else if field.type === 'date'}
+                <Input
+                  {id}
+                  type="date"
+                  value={textOf(field.key)}
+                  oninput={(event) => setCustom(field.key, event.currentTarget.value)}
+                />
+              {:else if field.type === 'url'}
+                <!-- A link is read left to right whatever the interface language, like a tag. -->
+                <Input
+                  {id}
+                  type="url"
+                  inputmode="url"
+                  dir="ltr"
+                  autocapitalize="off"
+                  spellcheck={false}
+                  value={textOf(field.key)}
+                  oninput={(event) => setCustom(field.key, event.currentTarget.value)}
+                />
+              {:else}
+                <Input
+                  {id}
+                  maxlength={4000}
+                  value={textOf(field.key)}
+                  oninput={(event) => setCustom(field.key, event.currentTarget.value)}
+                />
+              {/if}
+            {/snippet}
+          </Field>
+        {/if}
+      {/each}
+      {#if missing.length}
+        <p class="missing" aria-live="polite">
+          {t('custom_missing_required', isolated({ field: missingNames }))}
+        </p>
+      {/if}
+    {/if}
   </div>
 
   {#snippet footer()}
@@ -313,5 +543,51 @@ function submit() {
     grid-template-columns: minmax(0, 1fr) 124px;
     gap: 8px;
     align-items: start;
+  }
+  .group-title {
+    margin: 6px 0 -4px;
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--kern-ink-500);
+  }
+  /* Drawn like `Field` and `Label`, which wrap one control and cannot wrap a group of boxes. */
+  .choices {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    min-width: 0;
+  }
+  .legend {
+    padding: 0;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--kern-ink-650);
+    unicode-bidi: plaintext;
+  }
+  .req {
+    color: var(--kern-danger);
+    margin-inline-start: 3px;
+  }
+  .msg {
+    margin: 0;
+    font-size: 12px;
+    color: var(--kern-ink-350);
+  }
+  .choice-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .missing {
+    margin: -4px 0 0;
+    font-size: 12.5px;
+    line-height: 1.5;
+    /* A colour, not opacity — and not the danger red: nothing is wrong yet, something is missing. */
+    color: var(--kern-ink-600);
   }
 </style>

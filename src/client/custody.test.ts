@@ -9,23 +9,39 @@ import { custodyActions } from './custody.js'
  * neighbouring question and lives in `members.test.ts`, beside the file that answers it.
  */
 describe('custodyActions', () => {
+  const live = { archived: false, disposed: false, may: true }
+
   it('offers handing over when nobody has it, and handing on or back when somebody does', () => {
-    expect(custodyActions({ held: false, archived: false, may: true })).toEqual(['assign'])
-    expect(custodyActions({ held: true, archived: false, may: true })).toEqual(['transfer', 'return'])
+    expect(custodyActions({ ...live, held: false })).toEqual(['assign'])
+    expect(custodyActions({ ...live, held: true })).toEqual(['transfer', 'return'])
   })
 
   it('offers nothing without the permission — hidden, not disabled', () => {
-    expect(custodyActions({ held: false, archived: false, may: false })).toEqual([])
-    expect(custodyActions({ held: true, archived: false, may: false })).toEqual([])
+    expect(custodyActions({ ...live, held: false, may: false })).toEqual([])
+    expect(custodyActions({ ...live, held: true, may: false })).toEqual([])
   })
 
   it('offers nothing on an archived item, which the server refuses anyway', () => {
-    expect(custodyActions({ held: false, archived: true, may: true })).toEqual([])
-    expect(custodyActions({ held: true, archived: true, may: true })).toEqual([])
+    expect(custodyActions({ ...live, held: false, archived: true })).toEqual([])
+    expect(custodyActions({ ...live, held: true, archived: true })).toEqual([])
   })
 
   it('never offers assigning something that is already held', () => {
     // The one combination that would 409 every single time it was pressed.
-    expect(custodyActions({ held: true, archived: false, may: true })).not.toContain('assign')
+    expect(custodyActions({ ...live, held: true })).not.toContain('assign')
+  })
+
+  /**
+   * A lost or retired item can be taken back and cannot be given to anybody: the server refuses
+   * `assign` and `transfer` with `inventory.custody.disposed` and lets `return` through, because
+   * whoever is answerable for a lost laptop has to be able to stop being answerable for it.
+   */
+  it('offers only taking back a lost or retired item, and only while somebody has it', () => {
+    expect(custodyActions({ ...live, held: true, disposed: true })).toEqual(['return'])
+    expect(custodyActions({ ...live, held: false, disposed: true })).toEqual([])
+  })
+
+  it('still hides everything on a disposed item for somebody without the permission', () => {
+    expect(custodyActions({ ...live, held: true, disposed: true, may: false })).toEqual([])
   })
 })

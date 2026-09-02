@@ -27,8 +27,9 @@ export class StatsService {
       .select({
         total: sql<number>`count(*) filter (where ${assets.archivedAt} is null)`.mapWith(Number),
         archived: sql<number>`count(*) filter (where ${assets.archivedAt} is not null)`.mapWith(Number),
+        // "Available to hand out", which a lost or retired item is not, whoever is not holding it.
         unassigned:
-          sql<number>`count(*) filter (where ${assets.archivedAt} is null and ${assets.custodianUserId} is null)`.mapWith(
+          sql<number>`count(*) filter (where ${assets.archivedAt} is null and ${assets.custodianUserId} is null and ${assets.disposition} is null)`.mapWith(
             Number,
           ),
       })

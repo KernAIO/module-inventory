@@ -268,6 +268,13 @@ function serverReasons(): string[] {
         at = source.indexOf(call, at + 1)
       }
     }
+    /**
+     * The other place a reason lives: inside `KernError.badRequest`'s details, as `reason: '…'`.
+     * `FieldService.apply` refuses that way so it can put the field's name beside the token, and a
+     * refusal written like that is exactly as translatable — and exactly as easy to forget — as
+     * one passed positionally.
+     */
+    for (const match of source.matchAll(/reason:\s*'(inventory\.[^']+)'/g)) found.add(match[1]!)
   }
   return [...found].sort()
 }

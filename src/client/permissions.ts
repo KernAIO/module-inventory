@@ -28,6 +28,8 @@ export const INVENTORY_PERMISSIONS = {
   repairs: key('repair.manage'),
   /** The categories settings page, and nothing else. */
   categories: key('category.manage'),
+  /** The fields settings page. Reading the definitions rides `view`: the asset form needs them. */
+  fields: key('field.manage'),
 } as const
 
 export type InventoryPermission = keyof typeof INVENTORY_PERMISSIONS

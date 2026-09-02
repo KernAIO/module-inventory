@@ -34,12 +34,23 @@ describe('actionKey', () => {
       'assigned',
       'transferred',
       'returned',
-      'retired',
+      'archived',
       'restored',
+      'lost',
+      'written_off',
+      'reinstated',
     ]) {
       expect({ action, key: actionKey(action) }).toEqual({ action, key: `history_${action}` })
       expect({ action, has: `inventory.${actionKey(action)}` in en }).toEqual({ action, has: true })
     }
+  })
+
+  it('reads the word an earlier image wrote for archiving as the sentence it always meant', () => {
+    // `archived` was written as `retired` until 0.5.0, and those rows are permanent. The word now
+    // names a disposition — a write-off — so the old rows must land on the archive sentence and not
+    // on the one the word means today, and must not fall back as unknown either.
+    expect(actionKey('retired')).toBe('history_archived')
+    expect(isKnownAction('retired')).toBe(true)
   })
 
   it('falls back honestly for an action written by a newer image', () => {

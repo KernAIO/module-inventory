@@ -11,6 +11,7 @@ import {
   IconButton,
   keys,
   messageLocale,
+  navigation,
   Sheet,
   Skeleton,
   session,
@@ -18,13 +19,22 @@ import {
   Tabs,
 } from '@kernhq/ui'
 import { createQuery } from '@tanstack/svelte-query'
-import type { Asset, Category, CustodyPeriod, RepairListItem } from '../../contract/index.js'
+import type {
+  Asset,
+  Category,
+  CustodyPeriod,
+  FieldDef,
+  FieldType,
+  RepairListItem,
+} from '../../contract/index.js'
 import { MODULE_ID } from '../../contract/index.js'
 import { getInventoryApi } from '../api-instance.js'
 import { isolated } from '../bidi.js'
 import type { CoreApi, CoreMember } from '../core-api.js'
 import { type CustodyAction, custodyActions } from '../custody.js'
+import { type DispositionAction, dispositionActions } from '../disposition.js'
 import { t } from '../i18n.js'
+import { CUSTODIAN_PARAM } from '../links.js'
 import { directory, directoryStatus, nameOf, resolveName } from '../members.js'
 import { canInventory } from '../permissions.js'
 import { formatPrice } from '../price.js'
@@ -34,6 +44,7 @@ import { statusTone } from '../status.js'
 import AssetPhoto from './AssetPhoto.svelte'
 import AttachmentsSection from './AttachmentsSection.svelte'
 import CustodyDialog from './CustodyDialog.svelte'
+import DispositionDialog from './DispositionDialog.svelte'
 import RepairDialog from './RepairDialog.svelte'
 import RepairsSection from './RepairsSection.svelte'
 import Timeline from './Timeline.svelte'
@@ -68,6 +79,12 @@ const { workspaceId, assetId, onclose, onedit }: Props = $props()
 const api = getInventoryApi()
 const core = coreApi<CoreApi>()
 
+/**
+ * How many of a holder's items are fetched for the "also holding" line. One page, and the count
+ * is honest up to it: nobody holds two hundred laptops, and the line links to the full list.
+ */
+const ALSO_HOLDING_LIMIT = 200
+
 const enabled = $derived(Boolean(workspaceId && assetId))
 
 const assetQuery = createQuery(() => ({
@@ -94,6 +111,49 @@ const categoryNames = $derived(
   new Map((categoriesQuery.data ?? []).map((row: Category) => [row.id, row.name])),
 )
 const categoryName = (id: string): string | null => categoryNames.get(id) ?? null
+
+/**
+ * The workspace's own fields, **archived ones included**, for the reason the categories are.
+ *
+ * A value written under a field somebody later archived is still on the asset, and the point of
+ * archiving rather than deleting is that the panel can go on saying what the value is a value *of*.
+ * The same list turns a `custom.<key>` line on the timeline back into the field's name.
+ */
+const fieldsQuery = createQuery(() => ({
+  queryKey: inventoryKeys.fields(workspaceId, true),
+  queryFn: () => api.fields.list({ workspaceId, archived: true }),
+  enabled,
+}))
+const fieldDefs = $derived<FieldDef[]>(fieldsQuery.data ?? [])
+const fieldNames = $derived(new Map(fieldDefs.map((def) => [def.key, def.name])))
+const fieldName = (key: string): string | null => fieldNames.get(key) ?? null
+
+/**
+ * One stored value, in the words a person reads it in.
+ *
+ * A date through the same formatter as the built-in dates, a checkbox as a word rather than
+ * `true`, several choices joined the way the reader's language joins a list — «الف، ب و ج», not
+ * "a,b,c" — and a number in the reader's own digits. A link is text here rather than an anchor: the
+ * panel is a summary, and a value somebody typed is not something to navigate to by accident.
+ */
+function customValue(type: FieldType, value: unknown): string {
+  switch (type) {
+    case 'date':
+      return typeof value === 'string' ? formatDate(value) : String(value)
+    case 'checkbox':
+      return value === true ? t('yes') : t('no')
+    case 'multiselect':
+      return Array.isArray(value)
+        ? new Intl.ListFormat(messageLocale(), { style: 'long', type: 'conjunction' }).format(
+            value.map(String),
+          )
+        : String(value)
+    case 'number':
+      return typeof value === 'number' ? new Intl.NumberFormat(messageLocale()).format(value) : String(value)
+    default:
+      return String(value)
+  }
+}
 
 const membersQuery = createQuery(() => ({
   queryKey: keys.members(workspaceId),
@@ -129,6 +189,31 @@ const holderName = $derived(asset?.custodianUserId ? nameOf(asset.custodianUserI
 /** The same person, unresolved, so the avatar shows initials only for somebody actually found. */
 const holder = $derived(asset?.custodianUserId ? resolveName(asset.custodianUserId, dir) : null)
 
+/**
+ * What else the holder has — the "also holding" line under their name.
+ *
+ * The first caller of `custody.byUser`, and asked only while there is a holder to ask about. The
+ * answer is a page, so the number is honest up to the limit and the line is a *link* rather than
+ * a total: it opens the same list the offboarding notification opens, which is where the whole
+ * answer lives. This item is dropped from the count, because "also holding" is about the others.
+ */
+const heldByQuery = createQuery(() => ({
+  queryKey: inventoryKeys.heldBy(workspaceId, asset?.custodianUserId ?? ''),
+  queryFn: () =>
+    api.custody.byUser({ workspaceId, userId: asset?.custodianUserId as string, limit: ALSO_HOLDING_LIMIT }),
+  enabled: enabled && Boolean(asset?.custodianUserId),
+}))
+const alsoHolding = $derived(
+  (heldByQuery.data?.items ?? []).filter((row: Asset) => row.id !== asset?.id).length,
+)
+
+/** Opens the holder's whole list — the page's own `?custodian=` filter, which closes this panel. */
+function showHoldings() {
+  const userId = asset?.custodianUserId
+  if (!userId) return
+  void navigation.go(`${navigation.pathname}?${CUSTODIAN_PARAM}=${encodeURIComponent(userId)}`)
+}
+
 // ---------------------------------------------------------------------- what may be done here
 
 const canManage = $derived(canInventory('manage'))
@@ -138,18 +223,43 @@ const canCustody = $derived(canInventory('custody'))
  *
  * Empty for somebody without the permission — hidden, because they may never do it — and empty for
  * an archived item, where the sentence below says why rather than three buttons that cannot be
- * pressed. The server refuses every one of these again; this only stops the panel offering a door
+ * pressed. A lost or retired item keeps only *Take back*, beside a sentence saying to reinstate it
+ * first. The server refuses every one of these again; this only stops the panel offering a door
  * that will not open.
  */
 const available = $derived(
   custodyActions({
     held: Boolean(asset?.custodianUserId),
     archived: Boolean(asset?.archivedAt),
+    disposed: Boolean(asset?.disposition),
     may: canCustody,
   }),
 )
 
 let action = $state<CustodyAction | null>(null)
+
+/**
+ * Which of lost, retire and reinstate the Details tab offers — the same answer the row menu gives,
+ * from the same function. Buttons rather than a menu, because a panel has room to show what can
+ * be done and a menu hides it behind a click.
+ */
+const fate = $derived(
+  dispositionActions({
+    disposition: asset?.disposition ?? null,
+    archived: Boolean(asset?.archivedAt),
+    may: canManage,
+  }),
+)
+let dispositionAction = $state<DispositionAction | null>(null)
+
+/** The sentence under the badge once somebody has said what happened to it. */
+const dispositionLine = $derived(
+  asset?.disposition && asset.dispositionAt
+    ? asset.disposition === 'lost'
+      ? t('lost_since', isolated({ date: formatDate(asset.dispositionAt) }))
+      : t('retired_on', isolated({ date: formatDate(asset.dispositionAt) }))
+    : null,
+)
 
 /** `inventory.repair.manage`, and `inventory.asset.manage` is what attaching a file takes. */
 const canRepair = $derived(canInventory('repairs'))
@@ -195,19 +305,37 @@ $effect(() => {
   if (!TABS.some((item) => item.value === tab)) tab = 'details'
 })
 
-/** The rows of the Details section: a label, and a value already turned into words. */
-const facts = $derived.by<Array<{ label: string; value: string; ltr?: boolean }>>(() => {
+/**
+ * One row of the Details section: a label, and a value already turned into words.
+ *
+ * `id` rather than the label as the list key: a workspace can name a field "Location", and two
+ * rows keyed on the same word would be a duplicate key error on a panel that used to render.
+ */
+interface Fact {
+  id: string
+  label: string
+  value: string
+  ltr?: boolean
+}
+
+const facts = $derived.by<Fact[]>(() => {
   if (!asset) return []
-  const rows: Array<{ label: string; value: string; ltr?: boolean }> = [
+  const rows: Fact[] = [
     {
+      id: 'category',
       label: t('category'),
       value: (asset.categoryId && categoryName(asset.categoryId)) || t('category_none'),
     },
-    { label: t('serial_number'), value: asset.serialNumber ?? '—', ltr: true },
-    { label: t('location'), value: asset.location ?? '—' },
-    { label: t('purchased_on'), value: asset.purchasedOn ? formatDate(asset.purchasedOn) : '—' },
-    { label: t('purchased_from'), value: asset.purchasedFrom ?? '—' },
+    { id: 'serial', label: t('serial_number'), value: asset.serialNumber ?? '—', ltr: true },
+    { id: 'location', label: t('location'), value: asset.location ?? '—' },
     {
+      id: 'purchased_on',
+      label: t('purchased_on'),
+      value: asset.purchasedOn ? formatDate(asset.purchasedOn) : '—',
+    },
+    { id: 'purchased_from', label: t('purchased_from'), value: asset.purchasedFrom ?? '—' },
+    {
+      id: 'price',
       label: t('price'),
       value:
         asset.priceMinor === null
@@ -216,10 +344,34 @@ const facts = $derived.by<Array<{ label: string; value: string; ltr?: boolean }>
             // dinar has three, so reading the column as hundredths showed both wrong.
             `${formatPrice(asset.priceMinor, messageLocale(), asset.currency)} ${asset.currency ?? ''}`.trim(),
     },
-    { label: t('warranty_until'), value: asset.warrantyUntil ? formatDate(asset.warrantyUntil) : '—' },
-    { label: t('added_on'), value: formatDateTime(asset.createdAt) },
-    { label: t('updated_on'), value: formatDateTime(asset.updatedAt) },
+    {
+      id: 'warranty',
+      label: t('warranty_until'),
+      value: asset.warrantyUntil ? formatDate(asset.warrantyUntil) : '—',
+    },
+    { id: 'added', label: t('added_on'), value: formatDateTime(asset.createdAt) },
+    { id: 'updated', label: t('updated_on'), value: formatDateTime(asset.updatedAt) },
   ]
+  /**
+   * Then the workspace's own fields: every one that **applies** to this asset — live, and either
+   * workspace-wide or scoped to its category — and every one that **has a value** on it, whether it
+   * applies or not. An asset moved out of Laptops keeps the MAC address it was given, because the
+   * value is a fact that was recorded and re-filing does not un-record it; the row stays and only
+   * the question goes. '—' is shown only for a field that applies: a field that neither applies
+   * nor holds anything is not a row at all.
+   */
+  for (const def of fieldDefs) {
+    const applies = !def.archivedAt && (def.categoryId === null || def.categoryId === asset.categoryId)
+    const value = asset.custom[def.key]
+    const has = value !== null && value !== undefined
+    if (!applies && !has) continue
+    rows.push({
+      id: `custom:${def.key}`,
+      label: def.name,
+      value: has ? customValue(def.type, value) : '—',
+      ltr: def.type === 'url',
+    })
+  }
   return rows
 })
 </script>
@@ -271,6 +423,12 @@ const facts = $derived.by<Array<{ label: string; value: string; ltr?: boolean }>
       {:else}
         <Badge tone={statusTone(asset.status)}>{t(`status_${asset.status}`)}</Badge>
       {/if}
+      <!-- When, not only what: a badge says "Lost" and this says since when, which is the fact
+           somebody chasing it needs. Shown on an archived row too — a retired item that was then
+           archived is still a retired item. -->
+      {#if dispositionLine}
+        <span class="disposed">{dispositionLine}</span>
+      {/if}
     </div>
 
     <!-- The tab strip scrolls rather than pushing the panel sideways: five pills in German do not
@@ -284,13 +442,34 @@ const facts = $derived.by<Array<{ label: string; value: string; ltr?: boolean }>
             <AssetPhoto {workspaceId} {asset} canManage={canManage} />
           </div>
           <dl class="facts">
-            {#each facts as fact (fact.label)}
+            {#each facts as fact (fact.id)}
               <dt>{fact.label}</dt>
               <dd class:ltr={fact.ltr}>{fact.value}</dd>
             {/each}
           </dl>
           {#if asset.description}
             <p class="description">{asset.description}</p>
+          {/if}
+          <!-- What happened to it, and the way back. Retire is the write-off and wears the danger
+               colour, as it does in the row menu; the dialog behind each states what it closes. -->
+          {#if fate.length}
+            <div class="acts fate">
+              {#if fate.includes('reinstate')}
+                <Button size="sm" variant="secondary" icon="refresh-cw" onclick={() => (dispositionAction = 'reinstate')}>
+                  {t('reinstate')}
+                </Button>
+              {/if}
+              {#if fate.includes('lost')}
+                <Button size="sm" variant="secondary" icon="circle-help" onclick={() => (dispositionAction = 'lost')}>
+                  {t('mark_lost')}
+                </Button>
+              {/if}
+              {#if fate.includes('retire')}
+                <Button size="sm" variant="danger" icon="circle-x" onclick={() => (dispositionAction = 'retire')}>
+                  {t('retire')}
+                </Button>
+              {/if}
+            </div>
           {/if}
         {:else if pane === 'custody'}
           <div class="custody">
@@ -305,6 +484,13 @@ const facts = $derived.by<Array<{ label: string; value: string; ltr?: boolean }>
                       {t('custody_since', isolated({ date: formatDate(asset.custodySince) }))}
                     </span>
                   {/if}
+                  <!-- Nothing when it is zero or still loading: "also holding nothing" is not a
+                       fact worth a line, and a number that arrives a moment later would be. -->
+                  {#if alsoHolding > 0}
+                    <button type="button" class="also" onclick={showHoldings}>
+                      {t('custody_also_holding', { n: alsoHolding })}
+                    </button>
+                  {/if}
                 </div>
               {:else}
                 <div class="holder-text">
@@ -317,19 +503,28 @@ const facts = $derived.by<Array<{ label: string; value: string; ltr?: boolean }>
             {#if canCustody && asset.archivedAt}
               <!-- A disabled control with no explanation is a bug; one sentence says why instead. -->
               <p class="hint">{t('custody_archived_hint')}</p>
-            {:else if available.length}
-              <div class="acts">
-                {#each available as verb (verb)}
-                  <Button
-                    size="sm"
-                    variant={verb === 'return' ? 'secondary' : 'primary'}
-                    icon={verb === 'assign' ? 'user-plus' : verb === 'transfer' ? 'arrow-right' : 'undo-2'}
-                    onclick={() => (action = verb)}
-                  >
-                    {t(`custody_${verb}`)}
-                  </Button>
-                {/each}
-              </div>
+            {:else}
+              <!-- A lost or retired item cannot be given to anybody, and the sentence stands where
+                   the two handover buttons would. Taking it back stays beside it while somebody
+                   holds it: the server allows that, and the person answerable for a lost laptop
+                   has to be able to stop being answerable for it. -->
+              {#if canCustody && asset.disposition}
+                <p class="hint">{t('custody_disposed_hint')}</p>
+              {/if}
+              {#if available.length}
+                <div class="acts">
+                  {#each available as verb (verb)}
+                    <Button
+                      size="sm"
+                      variant={verb === 'return' ? 'secondary' : 'primary'}
+                      icon={verb === 'assign' ? 'user-plus' : verb === 'transfer' ? 'arrow-right' : 'undo-2'}
+                      onclick={() => (action = verb)}
+                    >
+                      {t(`custody_${verb}`)}
+                    </Button>
+                  {/each}
+                </div>
+              {/if}
             {/if}
 
             <h3 class="section">{t('custody_previous')}</h3>
@@ -398,6 +593,7 @@ const facts = $derived.by<Array<{ label: string; value: string; ltr?: boolean }>
             assetId={asset.id}
             {dir}
             {categoryName}
+            {fieldName}
             currency={asset.currency}
           />
         {/if}
@@ -424,6 +620,13 @@ const facts = $derived.by<Array<{ label: string; value: string; ltr?: boolean }>
     repairAction = null
     repairRow = null
   }}
+/>
+
+<DispositionDialog
+  {workspaceId}
+  asset={dispositionAction ? asset : null}
+  action={dispositionAction}
+  onclose={() => (dispositionAction = null)}
 />
 
 <style>
@@ -462,7 +665,42 @@ const facts = $derived.by<Array<{ label: string; value: string; ltr?: boolean }>
     gap: 12px;
   }
   .status-line {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
     margin-bottom: 12px;
+  }
+  .disposed {
+    font-size: 12.5px;
+    /* Muted with a colour, never opacity: this is the date somebody chasing a lost item needs. */
+    color: var(--kern-ink-600);
+  }
+  .fate {
+    margin-top: 16px;
+  }
+  /* A sentence that is also a link to the holder's list: no chrome, the row's own muted type, an
+     underline on hover, and the rounded focus ring every other control gets. Padding grows the hit
+     area and the equal negative margin gives the space back, so the column does not move. */
+  .also {
+    appearance: none;
+    background: none;
+    border: 0;
+    font: inherit;
+    font-size: 11.5px;
+    color: var(--kern-ink-600);
+    text-align: start;
+    padding-block: 3px;
+    margin-block: -3px;
+    padding-inline: 0;
+    border-radius: var(--kern-r-sm);
+    text-decoration: underline;
+    text-decoration-color: var(--kern-border);
+    text-underline-offset: 2px;
+  }
+  .also:hover {
+    color: var(--kern-ink-900);
+    text-decoration-color: currentColor;
   }
   /**
    * Five pills do not fit 440px in German, and a document that scrolls sideways is a defect the

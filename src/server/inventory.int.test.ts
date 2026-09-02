@@ -4,6 +4,7 @@ import {
   type core,
   defineEvent,
   type EntityChange,
+  type EventEnvelope,
   type Principal,
   type WorkspaceId,
 } from '@kernhq/contracts'
@@ -14,7 +15,7 @@ import { drizzle } from 'drizzle-orm/node-postgres'
 import pg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { z } from 'zod'
-import { type Asset, MAX_LIVE_CATEGORIES } from '../contract/models.js'
+import { type Asset, type FieldType, MAX_LIVE_CATEGORIES } from '../contract/models.js'
 import { inventoryModule } from './index.js'
 import { activeWorkspaces, reconcileStatuses } from './jobs.js'
 import { inventoryRouter } from './router.js'
@@ -103,6 +104,18 @@ const WS_REGISTRY = workspace()
 /** A workspace with HR but with Inventory switched off, which must hear nothing. */
 const WS_NO_INVENTORY = workspace()
 const WS_SEARCH = workspace()
+/** Its own, for the reason `WS_ORDER` is: `fields.reorder` insists on the whole live set. */
+const WS_FIELDS = workspace()
+/**
+ * Its own, because a required workspace-wide field refuses every other block's `createAsset` the
+ * moment it exists — and the point of the block is to make one.
+ */
+const WS_VALUES = workspace()
+/**
+ * Its own, because the register-in-numbers assertions count lost and retired rows over the whole
+ * workspace, and the reconciliation sweep is asked to find nothing out of step in it.
+ */
+const WS_DISPOSE = workspace()
 
 const ALICE = randomUUID()
 const BOB = randomUUID()
@@ -189,6 +202,16 @@ const NOTIFICATIONS_FAIL_FOR = new Set<string>()
  */
 const CHANGES: Array<{ workspaceId: string } & EntityChange> = []
 
+/**
+ * Every event this module emitted, in order.
+ *
+ * The bus is in-process here — `NATS_URL` is unset — so this is the complete record, and a handler
+ * subscribed to `inventory.*` has run before `kernel.emit` resolves, which is what lets a test read
+ * the event the moment the procedure returns. It carries the one thing `CHANGES` cannot: *which*
+ * disposition an item was given, which is the whole reason `inventory.asset.disposed` names one.
+ */
+const EVENTS: EventEnvelope[] = []
+
 const INDEXED: core.SearchDocument[] = []
 const UNINDEXED: Array<{ workspaceId: string; object: { module: string; type: string; id: string } }> = []
 
@@ -231,6 +254,7 @@ for (const workspaceId of [
   WS_CAP,
   WS_STRAND,
   WS_FILES,
+  WS_DISPOSE,
 ]) {
   seedMember(workspaceId, ALICE, 'admin', 'Alice Ng')
   seedMember(workspaceId, BOB, 'member', 'Bob Ito')
@@ -390,6 +414,9 @@ beforeAll(async () => {
     },
   })
   registerCoreStubs(kernel)
+  await kernel.events.subscribe('inventory.*', (event) => {
+    EVENTS.push(event)
+  })
 
   // Recorded on the way through rather than replaced: the real publisher still runs, so this cannot
   // make a broken announcement look like a working one.
@@ -423,6 +450,7 @@ interface NewAsset {
   warrantyUntil?: string | null
   priceMinor?: number | null
   currency?: string | null
+  custom?: Record<string, unknown>
 }
 
 const createAsset = (workspaceId: WorkspaceId, input: NewAsset, userId = ALICE): Promise<Asset> =>
@@ -469,12 +497,37 @@ function messageOf(err: unknown): string {
 function reasonOf(err: unknown): string | null {
   let cursor: unknown = err
   for (let depth = 0; depth < 5 && cursor; depth++) {
+    // `details.reason` third: `KernError.badRequest` keeps its reason *inside* `details`, beside the
+    // field it names, where `conflict` carries one on the error itself — and in-process, through
+    // `call()`, nothing has folded `details` into `data` yet.
     const found =
-      (cursor as { data?: { reason?: unknown } }).data?.reason ?? (cursor as { reason?: unknown }).reason
+      (cursor as { data?: { reason?: unknown } }).data?.reason ??
+      (cursor as { details?: { reason?: unknown } }).details?.reason ??
+      (cursor as { reason?: unknown }).reason
     if (typeof found === 'string') return found
     cursor = (cursor as { cause?: unknown }).cause
   }
   return null
+}
+
+/**
+ * One named entry of a refusal's details — the field a `BAD_REQUEST` from `FieldService.apply`
+ * names, which is the half a form reads to put the sentence beside the right control.
+ *
+ * `KernError.badRequest(message, details)` keeps it in `details`, and `kernErrorToORPC` folds that
+ * into `data` on the way out over HTTP; through `call()` the error arrives as itself. Read out of
+ * whichever of the two this depth carries, through `cause` like the helpers above.
+ */
+function detailOf(err: unknown, key: string): unknown {
+  let cursor: unknown = err
+  for (let depth = 0; depth < 5 && cursor; depth++) {
+    const bag =
+      (cursor as { data?: Record<string, unknown> }).data ??
+      (cursor as { details?: Record<string, unknown> }).details
+    if (bag && typeof bag === 'object' && key in bag) return bag[key]
+    cursor = (cursor as { cause?: unknown }).cause
+  }
+  return undefined
 }
 
 async function refusedWith(fn: () => Promise<unknown>): Promise<string> {
@@ -1170,7 +1223,9 @@ describe('the history trail', () => {
     )
     expect(back.archivedAt).toBeNull()
     const rows = await historyOf(WS_A, asset.id)
-    expect(rows.map((r) => r.action)).toEqual(['created', 'retired', 'restored'])
+    // `archived`, which was `retired` until 0.5.0 — that word means a write-off now, and it is a
+    // disposition rather than an archive. `AssetHistoryEntry` in the contract says why it moved.
+    expect(rows.map((r) => r.action)).toEqual(['created', 'archived', 'restored'])
   })
 })
 
@@ -4905,5 +4960,929 @@ describe('two people taking the same item back at once', () => {
       ),
     )
     expect(refusal).toBe('CONFLICT')
+  })
+})
+
+// =================================================================================================
+// A workspace's own fields, the values written under them, and what somebody said happened to an
+// item. Three blocks in three workspaces: fields because `reorder` insists on the whole live set,
+// values because a required workspace-wide field refuses every other block's `create` the moment it
+// exists, and dispositions because the register-in-numbers assertions count lost and retired rows
+// over the whole workspace.
+// =================================================================================================
+
+/** A field as a test defines one: the create input without the workspace. */
+interface NewField {
+  key: string
+  name: string
+  type: FieldType
+  options?: string[]
+  required?: boolean
+  categoryId?: string | null
+  description?: string | null
+}
+
+/**
+ * Fields, which are categories with a type: a name and a place in a list, archived rather than
+ * deleted, the sequence rewritten whole. What is new is that the type decides what `options` means,
+ * and that the key is the one thing about a field that cannot change — every value already written
+ * lives under it.
+ */
+describe('a workspace’s own fields', () => {
+  const ctx = () => ({ context: asUser(ALICE, WS_FIELDS) })
+  const create = (input: NewField) => call(inv.fields.create, { workspaceId: WS_FIELDS, ...input }, ctx())
+  const list = (archived = false) => call(inv.fields.list, { workspaceId: WS_FIELDS, archived }, ctx())
+  const reorder = (fieldIds: string[]) =>
+    call(inv.fields.reorder, { workspaceId: WS_FIELDS, fieldIds }, ctx())
+  const keys = async (archived = false) => (await list(archived)).map((f) => f.key)
+  let laptops: string
+
+  beforeAll(async () => {
+    laptops = (await call(inv.categories.create, { workspaceId: WS_FIELDS, name: 'Laptops' }, ctx())).id
+  })
+
+  it('defines one of every kind, and lists them in the order they were made', async () => {
+    await create({ key: 'supplier_ref', name: 'Supplier reference', type: 'text' })
+    await create({ key: 'cost_centre', name: 'Cost centre', type: 'number', description: 'Four digits' })
+    await create({ key: 'insured_until', name: 'Insured until', type: 'date' })
+    // Padded and repeated on purpose: the list is trimmed and de-duplicated by exact text.
+    await create({ key: 'site', name: 'Site', type: 'select', options: ['Berlin', ' Lisbon ', 'Berlin'] })
+    await create({ key: 'tags', name: 'Tags', type: 'multiselect', options: ['Leased', 'Fragile'] })
+    await create({ key: 'encrypted', name: 'Encrypted', type: 'checkbox' })
+    const manual = await create({ key: 'manual', name: 'Manual', type: 'url', categoryId: laptops })
+
+    const rows = await list()
+    expect(rows.map((f) => f.key)).toEqual([
+      'supplier_ref',
+      'cost_centre',
+      'insured_until',
+      'site',
+      'tags',
+      'encrypted',
+      'manual',
+    ])
+    expect(rows.map((f) => f.type)).toEqual([
+      'text',
+      'number',
+      'date',
+      'select',
+      'multiselect',
+      'checkbox',
+      'url',
+    ])
+    expect(new Set(rows.map((f) => f.order)).size, 'and no two of them share a place').toBe(rows.length)
+    expect(rows.find((f) => f.key === 'site')?.options).toEqual(['Berlin', 'Lisbon'])
+    expect(rows.find((f) => f.key === 'tags')?.options).toEqual(['Leased', 'Fragile'])
+    for (const row of rows.filter((f) => f.type !== 'select' && f.type !== 'multiselect'))
+      expect(row.options, `${row.key} takes no choices`).toEqual([])
+    expect(manual.categoryId, 'asked about on laptops only').toBe(laptops)
+    expect(
+      rows.filter((f) => f.key !== 'manual').every((f) => f.categoryId === null),
+      'the rest are workspace-wide',
+    ).toBe(true)
+    expect(
+      rows.every((f) => f.required === false),
+      'optional unless somebody says otherwise',
+    ).toBe(true)
+    expect(rows.find((f) => f.key === 'cost_centre')?.description).toBe('Four digits')
+  })
+
+  it('refuses a second field under a key already taken, with the token the client translates', async () => {
+    const refusal = await capture(() => create({ key: 'site', name: 'Site again', type: 'text' }))
+    expect(codeOf(refusal)).toBe('CONFLICT')
+    expect(reasonOf(refusal)).toBe('inventory.field.key_taken')
+    expect(messageOf(refusal), 'and the sentence names the key').toContain('site')
+    expect(await keys(), 'nothing was written').toHaveLength(7)
+  })
+
+  it('refuses a choice field with nothing to choose from', async () => {
+    for (const type of ['select', 'multiselect'] as const) {
+      for (const options of [undefined, []]) {
+        const refusal = await capture(() =>
+          create({ key: `empty_${type}`, name: 'Nothing to pick', type, options }),
+        )
+        expect({ type, options, code: codeOf(refusal), reason: reasonOf(refusal) }).toEqual({
+          type,
+          options,
+          code: 'BAD_REQUEST',
+          reason: 'inventory.field.no_options',
+        })
+      }
+    }
+    expect(await keys(true)).toHaveLength(7)
+  })
+
+  it('refuses a list of choices on a field that reads none', async () => {
+    for (const type of ['text', 'number', 'date', 'checkbox', 'url'] as const) {
+      const refusal = await capture(() =>
+        create({ key: `listed_${type}`, name: 'With a list', type, options: ['Red'] }),
+      )
+      expect({ type, code: codeOf(refusal), reason: reasonOf(refusal) }).toEqual({
+        type,
+        code: 'BAD_REQUEST',
+        reason: 'inventory.field.options_unused',
+      })
+    }
+    expect(await keys(true)).toHaveLength(7)
+  })
+
+  it('renames and re-scopes a field, and the key, the type and the place stay where they were', async () => {
+    const before = (await list()).find((f) => f.key === 'supplier_ref') as NonNullable<
+      Awaited<ReturnType<typeof list>>[number]
+    >
+    const after = await call(
+      inv.fields.update,
+      {
+        workspaceId: WS_FIELDS,
+        fieldId: before.id,
+        name: 'Supplier ref.',
+        description: 'Off the invoice',
+        categoryId: laptops,
+        required: true,
+      },
+      ctx(),
+    )
+    expect(after).toMatchObject({
+      id: before.id,
+      key: 'supplier_ref',
+      type: 'text',
+      order: before.order,
+      name: 'Supplier ref.',
+      description: 'Off the invoice',
+      categoryId: laptops,
+      required: true,
+    })
+    // `null` on the two nullable columns means "clear it"; a patch that never mentions the name
+    // leaves it alone.
+    const wide = await call(
+      inv.fields.update,
+      { workspaceId: WS_FIELDS, fieldId: before.id, categoryId: null, description: null, required: false },
+      ctx(),
+    )
+    expect({
+      name: wide.name,
+      categoryId: wide.categoryId,
+      description: wide.description,
+      required: wide.required,
+    }).toEqual({
+      name: 'Supplier ref.',
+      categoryId: null,
+      description: null,
+      required: false,
+    })
+  })
+
+  it('checks a changed list of choices the way it checks a new one', async () => {
+    const site = (await list()).find((f) => f.key === 'site') as NonNullable<
+      Awaited<ReturnType<typeof list>>[number]
+    >
+    const emptied = await capture(() =>
+      call(inv.fields.update, { workspaceId: WS_FIELDS, fieldId: site.id, options: [] }, ctx()),
+    )
+    expect(reasonOf(emptied)).toBe('inventory.field.no_options')
+    const grown = await call(
+      inv.fields.update,
+      { workspaceId: WS_FIELDS, fieldId: site.id, options: ['Berlin', 'Lisbon', 'Porto'] },
+      ctx(),
+    )
+    expect(grown.options).toEqual(['Berlin', 'Lisbon', 'Porto'])
+    // A patch that never mentions the options keeps them.
+    const renamed = await call(
+      inv.fields.update,
+      { workspaceId: WS_FIELDS, fieldId: site.id, name: 'Office' },
+      ctx(),
+    )
+    expect(renamed.options).toEqual(['Berlin', 'Lisbon', 'Porto'])
+  })
+
+  it('archives and restores, and a restore joins the end', async () => {
+    const first = (await list())[0] as NonNullable<Awaited<ReturnType<typeof list>>[number]>
+    expect(first.key).toBe('supplier_ref')
+    const archived = await call(
+      inv.fields.archive,
+      { workspaceId: WS_FIELDS, fieldId: first.id, archived: true },
+      ctx(),
+    )
+    expect(archived.archivedAt).toBeTruthy()
+    expect(await keys(), 'gone from the form').not.toContain('supplier_ref')
+    expect(await keys(true), 'and still there').toContain('supplier_ref')
+
+    const back = await call(
+      inv.fields.archive,
+      { workspaceId: WS_FIELDS, fieldId: first.id, archived: false },
+      ctx(),
+    )
+    expect(back.archivedAt).toBeNull()
+    const rows = await list()
+    expect(rows.at(-1)?.key, 'restored to the end rather than to the place it left').toBe('supplier_ref')
+    expect(new Set(rows.map((f) => f.order)).size).toBe(rows.length)
+  })
+
+  it('renumbers the live sequence from the ids it was handed, and announces only the rows that moved', async () => {
+    const before = await list()
+    const ids = before.map((f) => f.id)
+    expect(ids).toHaveLength(7)
+    const reversed = [...ids].reverse()
+
+    CHANGES.length = 0
+    const answered = await reorder(reversed)
+    expect(answered.map((f) => f.id)).toEqual(reversed)
+    expect(
+      answered.map((f) => f.order),
+      'contiguous from zero, with no ties left behind',
+    ).toEqual(reversed.map((_, index) => index))
+    expect(
+      (await list()).map((f) => f.id),
+      'and the next read agrees',
+    ).toEqual(reversed)
+    expect(new Set(CHANGES.map((c) => c.entity)), 'a field changed, not an asset').toEqual(new Set(['field']))
+    // Exactly the rows whose number changed. The restore above appended at `max + 1`, so the numbers
+    // were not contiguous going in, and which rows those are is worked out rather than assumed.
+    const renumbered = before.filter((f) => f.order !== reversed.indexOf(f.id)).map((f) => f.id)
+    expect(CHANGES.map((c) => c.id).sort()).toEqual(renumbered.sort())
+
+    // Now they are contiguous, so swapping two neighbours announces those two and nobody else.
+    const swapped = [reversed[1] as string, reversed[0] as string, ...reversed.slice(2)]
+    CHANGES.length = 0
+    await reorder(swapped)
+    expect(CHANGES.map((c) => c.id).sort()).toEqual([reversed[0] as string, reversed[1] as string].sort())
+
+    CHANGES.length = 0
+    await reorder(swapped)
+    expect(CHANGES, 'the same order again moves nothing and announces nothing').toEqual([])
+  })
+
+  it('refuses an order that leaves out a field added while the page was open', async () => {
+    const ids = (await list()).map((f) => f.id)
+    // The other tab.
+    await create({ key: 'added_meanwhile', name: 'Added meanwhile', type: 'text' })
+
+    const refusal = await capture(() => reorder([...ids].reverse()))
+    expect(codeOf(refusal)).toBe('CONFLICT')
+    expect(reasonOf(refusal)).toBe('inventory.field.order_stale')
+    expect((await list()).map((f) => f.id).slice(0, ids.length), 'refused whole').toEqual(ids)
+  })
+
+  it('refuses an order naming a field archived while the page was open', async () => {
+    const rows = await list()
+    const last = rows.at(-1) as NonNullable<(typeof rows)[number]>
+    expect(last.key).toBe('added_meanwhile')
+    await call(inv.fields.archive, { workspaceId: WS_FIELDS, fieldId: last.id, archived: true }, ctx())
+
+    const refusal = await capture(() => reorder(rows.map((f) => f.id)))
+    expect(codeOf(refusal)).toBe('CONFLICT')
+    expect(reasonOf(refusal)).toBe('inventory.field.order_stale')
+  })
+
+  it('refuses an order naming a field from another workspace, and writes nothing', async () => {
+    const theirs = await call(
+      inv.fields.create,
+      { workspaceId: WS_B, key: 'not_ours', name: 'Not ours to order', type: 'text' },
+      { context: asUser(BOB, WS_B) },
+    )
+    const ids = (await list()).map((f) => f.id)
+    // Permuted as well as poisoned: if the renumbering ran before the check, the order would move.
+    const refusal = await capture(() =>
+      reorder([ids[1] as string, ids[0] as string, ...ids.slice(2), theirs.id]),
+    )
+    expect(codeOf(refusal), 'a field this workspace does not have is missing, not forbidden').toBe(
+      'NOT_FOUND',
+    )
+    expect(
+      (await list()).map((f) => f.id),
+      'nothing was written',
+    ).toEqual(ids)
+
+    // And the other workspace's own field was not renumbered on the way past.
+    const theirsAfter = await call(
+      inv.fields.list,
+      { workspaceId: WS_B, archived: true },
+      { context: asUser(BOB, WS_B) },
+    )
+    expect(theirsAfter.find((f) => f.id === theirs.id)?.order).toBe(theirs.order)
+  })
+
+  it('refuses an order that names the same field twice', async () => {
+    const ids = (await list()).map((f) => f.id)
+    expect(await refusedWith(() => reorder([ids[0] as string, ...ids]))).toBe('BAD_REQUEST')
+    expect((await list()).map((f) => f.id)).toEqual(ids)
+  })
+
+  it('does not show one workspace another’s fields, nor let it edit them', async () => {
+    const mine = new Set((await list(true)).map((f) => f.id))
+    const theirs = await call(
+      inv.fields.list,
+      { workspaceId: WS_B, archived: true },
+      { context: asUser(BOB, WS_B) },
+    )
+    expect(theirs.some((f) => mine.has(f.id))).toBe(false)
+
+    const first = (await list())[0] as NonNullable<Awaited<ReturnType<typeof list>>[number]>
+    expect(
+      await refusedWith(() =>
+        call(
+          inv.fields.update,
+          { workspaceId: WS_B, fieldId: first.id, name: 'Stolen' },
+          { context: asUser(BOB, WS_B) },
+        ),
+      ),
+    ).toBe('NOT_FOUND')
+    expect(
+      await refusedWith(() =>
+        call(
+          inv.fields.archive,
+          { workspaceId: WS_B, fieldId: first.id, archived: true },
+          { context: asUser(BOB, WS_B) },
+        ),
+      ),
+    ).toBe('NOT_FOUND')
+  })
+})
+
+/**
+ * The values, which is the whole reason `assets.custom` is allowed to exist: every key in a request
+ * is a claim about a field this workspace defined, and `FieldService.apply` is the one place it is
+ * checked. Each refusal below carries a stable reason and the field's own **name**, because that is
+ * what the form puts beside the control — in the reader's language, not this file's.
+ */
+describe('values written under those fields', () => {
+  const ctx = () => ({ context: asUser(ALICE, WS_VALUES) })
+  const define = (input: NewField) => call(inv.fields.create, { workspaceId: WS_VALUES, ...input }, ctx())
+  const valued = (custom: Record<string, unknown>, extra: Partial<NewAsset> = {}) =>
+    createAsset(WS_VALUES, { name: 'Valued', ...extra, custom })
+  const patch = (
+    assetId: string,
+    input: { name?: string; categoryId?: string | null; custom?: Record<string, unknown> },
+  ) => call(inv.assets.update, { workspaceId: WS_VALUES, assetId, ...input }, ctx())
+  const getAsset = (assetId: string) => call(inv.assets.get, { workspaceId: WS_VALUES, assetId }, ctx())
+  const timeline = async (assetId: string) =>
+    (await call(inv.assets.history, { workspaceId: WS_VALUES, assetId }, ctx())).items
+  const byField = (a: { field: string }, b: { field: string }) => a.field.localeCompare(b.field)
+  let laptops: string
+
+  /** One good value of each kind. */
+  const EVERY_KIND = {
+    supplier_ref: 'ACME-2291',
+    cost_centre: 4100,
+    insured_until: '2027-03-31',
+    site: 'Berlin',
+    tags: ['Leased', 'Fragile'],
+    encrypted: true,
+    manual: 'https://example.test/manual.pdf',
+  }
+
+  beforeAll(async () => {
+    laptops = (await call(inv.categories.create, { workspaceId: WS_VALUES, name: 'Laptops' }, ctx())).id
+    await define({ key: 'supplier_ref', name: 'Supplier reference', type: 'text' })
+    await define({ key: 'cost_centre', name: 'Cost centre', type: 'number' })
+    await define({ key: 'insured_until', name: 'Insured until', type: 'date' })
+    await define({ key: 'site', name: 'Site', type: 'select', options: ['Berlin', 'Lisbon'] })
+    await define({ key: 'tags', name: 'Tags', type: 'multiselect', options: ['Leased', 'Fragile', 'Loaner'] })
+    await define({ key: 'encrypted', name: 'Encrypted', type: 'checkbox' })
+    await define({ key: 'manual', name: 'Manual', type: 'url' })
+    // Required, and only for laptops.
+    await define({
+      key: 'mac_address',
+      name: 'MAC address',
+      type: 'text',
+      categoryId: laptops,
+      required: true,
+    })
+  })
+
+  it('stores a valid value of every kind, and hands them all back', async () => {
+    const asset = await valued(EVERY_KIND)
+    expect(asset.custom).toEqual(EVERY_KIND)
+    expect((await getAsset(asset.id)).custom, '`get` reads the same column').toEqual(EVERY_KIND)
+    // A string is stored trimmed, because a padded one is what a control produces.
+    const padded = await valued({ supplier_ref: '  ACME-1  ' })
+    expect(padded.custom).toEqual({ supplier_ref: 'ACME-1' })
+    // Nothing said is nothing stored.
+    expect((await createAsset(WS_VALUES, { name: 'Plain' })).custom).toEqual({})
+  })
+
+  it('refuses a key nothing defines, naming the key', async () => {
+    const refusal = await capture(() => valued({ colour: 'red' }))
+    expect(codeOf(refusal)).toBe('BAD_REQUEST')
+    expect(reasonOf(refusal)).toBe('inventory.field.unknown')
+    expect(detailOf(refusal, 'field'), 'the key, because there is no name to give').toBe('colour')
+  })
+
+  it('refuses a value of the wrong shape for each kind, naming the field', async () => {
+    const wrong: Array<[key: string, value: unknown, name: string]> = [
+      ['supplier_ref', 42, 'Supplier reference'],
+      ['cost_centre', '4100', 'Cost centre'],
+      ['insured_until', '31/03/2027', 'Insured until'],
+      ['insured_until', '2027-13-40', 'Insured until'],
+      ['site', 'Paris', 'Site'],
+      ['tags', ['Leased', 'Leased'], 'Tags'],
+      ['tags', ['Leased', 'Rented'], 'Tags'],
+      ['tags', 'Leased', 'Tags'],
+      ['manual', 'ftp://example.test/manual.pdf', 'Manual'],
+      ['manual', 'example.test/manual.pdf', 'Manual'],
+      ['encrypted', 'yes', 'Encrypted'],
+      ['encrypted', 1, 'Encrypted'],
+    ]
+    for (const [key, value, name] of wrong) {
+      const refusal = await capture(() => valued({ [key]: value }))
+      expect({
+        key,
+        value,
+        code: codeOf(refusal),
+        reason: reasonOf(refusal),
+        field: detailOf(refusal, 'field'),
+      }).toEqual({
+        key,
+        value,
+        code: 'BAD_REQUEST',
+        reason: 'inventory.field.invalid',
+        field: name,
+      })
+    }
+  })
+
+  it('demands a required field only where it applies', async () => {
+    const refusal = await capture(() => createAsset(WS_VALUES, { name: 'Bare laptop', categoryId: laptops }))
+    expect(codeOf(refusal)).toBe('BAD_REQUEST')
+    expect(reasonOf(refusal)).toBe('inventory.field.required')
+    expect(detailOf(refusal, 'field'), 'the field’s name, which is what the sentence says').toBe(
+      'MAC address',
+    )
+
+    // A whiteboard is not a laptop, so it is not asked.
+    const elsewhere = await createAsset(WS_VALUES, { name: 'Whiteboard' })
+    expect(elsewhere.custom).toEqual({})
+    const laptop = await createAsset(WS_VALUES, {
+      name: 'ThinkPad',
+      categoryId: laptops,
+      custom: { mac_address: '00:1A:2B:3C:4D:5E' },
+    })
+    expect(laptop.custom).toEqual({ mac_address: '00:1A:2B:3C:4D:5E' })
+
+    // Re-filing the whiteboard under Laptops is an *update*, and an update never demands a value the
+    // asset never had — it only refuses clearing one. So the move goes through with the MAC missing,
+    // exactly as an asset made before the field became required is left missing rather than locked;
+    // and once it has one, it is asked about against the category it is now in.
+    const moved = await patch(elsewhere.id, { categoryId: laptops })
+    expect({ categoryId: moved.categoryId, custom: moved.custom }).toEqual({
+      categoryId: laptops,
+      custom: {},
+    })
+    const filed = await patch(elsewhere.id, { custom: { mac_address: 'AA:BB:CC:DD:EE:FF' } })
+    expect(filed.custom).toEqual({ mac_address: 'AA:BB:CC:DD:EE:FF' })
+    const cleared = await capture(() => patch(elsewhere.id, { custom: { mac_address: null } }))
+    expect(reasonOf(cleared)).toBe('inventory.field.required')
+    expect(detailOf(cleared, 'field')).toBe('MAC address')
+  })
+
+  it('merges a patch, and writes one diff line per key that moved', async () => {
+    const asset = await valued(EVERY_KIND)
+    const after = await patch(asset.id, { custom: { cost_centre: 4200, tags: ['Loaner'] } })
+    expect(after.custom, 'the keys the patch never mentioned are exactly where they were').toEqual({
+      ...EVERY_KIND,
+      cost_centre: 4200,
+      tags: ['Loaner'],
+    })
+    expect((await getAsset(asset.id)).custom).toEqual(after.custom)
+
+    const [latest] = await timeline(asset.id)
+    expect(latest?.action).toBe('updated')
+    expect([...(latest?.changes ?? [])].sort(byField)).toEqual([
+      { field: 'custom.cost_centre', from: 4100, to: 4200 },
+      { field: 'custom.tags', from: ['Leased', 'Fragile'], to: ['Loaner'] },
+    ])
+
+    // A patch that mentions no value at all leaves every one of them alone, and says nothing about them.
+    const renamed = await patch(asset.id, { name: 'Valued, renamed' })
+    expect(renamed.custom).toEqual(after.custom)
+    expect((await timeline(asset.id))[0]?.changes.map((c) => c.field)).toEqual(['name'])
+
+    // A value written where there was none is a line from nothing.
+    const fresh = await createAsset(WS_VALUES, { name: 'Empty at first' })
+    await patch(fresh.id, { custom: { site: 'Lisbon' } })
+    expect((await timeline(fresh.id))[0]?.changes).toEqual([
+      { field: 'custom.site', from: null, to: 'Lisbon' },
+    ])
+  })
+
+  it('clears a value for `null`, `""` and `[]`, and leaves the rest alone', async () => {
+    const asset = await valued(EVERY_KIND)
+    const after = await patch(asset.id, { custom: { supplier_ref: '', tags: [], manual: null, site: '   ' } })
+    expect(after.custom).toEqual({ cost_centre: 4100, insured_until: '2027-03-31', encrypted: true })
+
+    const [latest] = await timeline(asset.id)
+    expect([...(latest?.changes ?? [])].sort(byField)).toEqual([
+      { field: 'custom.manual', from: 'https://example.test/manual.pdf', to: null },
+      { field: 'custom.site', from: 'Berlin', to: null },
+      { field: 'custom.supplier_ref', from: 'ACME-2291', to: null },
+      { field: 'custom.tags', from: ['Leased', 'Fragile'], to: null },
+    ])
+
+    // Clearing something already clear changes nothing, and the timeline says nothing.
+    const again = await patch(asset.id, { custom: { manual: null } })
+    expect(again.custom).toEqual(after.custom)
+    expect((await timeline(asset.id))[0]?.id).toBe(latest?.id)
+  })
+
+  it('refuses clearing a required field that applies, and stops asking once it no longer does', async () => {
+    const laptop = await createAsset(WS_VALUES, {
+      name: 'Required laptop',
+      categoryId: laptops,
+      custom: { mac_address: 'AA:BB:CC:DD:EE:01' },
+    })
+    for (const empty of [null, '', '   ']) {
+      const refusal = await capture(() => patch(laptop.id, { custom: { mac_address: empty } }))
+      expect({
+        empty,
+        code: codeOf(refusal),
+        reason: reasonOf(refusal),
+        field: detailOf(refusal, 'field'),
+      }).toEqual({
+        empty,
+        code: 'BAD_REQUEST',
+        reason: 'inventory.field.required',
+        field: 'MAC address',
+      })
+    }
+    expect((await getAsset(laptop.id)).custom).toEqual({ mac_address: 'AA:BB:CC:DD:EE:01' })
+
+    // Moved out of Laptops the value stays recorded — re-filing does not un-record a fact — and the
+    // question is simply no longer asked, so it may then be cleared.
+    const unfiled = await patch(laptop.id, { categoryId: null })
+    expect(unfiled.custom).toEqual({ mac_address: 'AA:BB:CC:DD:EE:01' })
+    expect((await patch(laptop.id, { custom: { mac_address: null } })).custom).toEqual({})
+  })
+
+  it('does not lock an older asset when a field becomes required after it was made', async () => {
+    const older = await createAsset(WS_VALUES, { name: 'Made before the rule' })
+    const owner = await define({ key: 'owner', name: 'Owner', type: 'text', required: true })
+
+    // A new asset has to say who owns it.
+    const refusal = await capture(() => createAsset(WS_VALUES, { name: 'Made after the rule' }))
+    expect(codeOf(refusal)).toBe('BAD_REQUEST')
+    expect(reasonOf(refusal)).toBe('inventory.field.required')
+    expect(detailOf(refusal, 'field')).toBe('Owner')
+
+    // The older one never had it and can still be edited — whether or not the patch touches a value.
+    expect((await patch(older.id, { name: 'Made before the rule, renamed' })).custom).toEqual({})
+    expect((await patch(older.id, { custom: { site: 'Lisbon' } })).custom).toEqual({ site: 'Lisbon' })
+
+    // Once it has one, it may not lose it.
+    expect((await patch(older.id, { custom: { owner: 'Finance' } })).custom).toEqual({
+      site: 'Lisbon',
+      owner: 'Finance',
+    })
+    expect(reasonOf(await capture(() => patch(older.id, { custom: { owner: '' } })))).toBe(
+      'inventory.field.required',
+    )
+
+    // Archived, the field is asked about nowhere and writable by nothing — and what was written under
+    // it is still there to read.
+    await call(inv.fields.archive, { workspaceId: WS_VALUES, fieldId: owner.id, archived: true }, ctx())
+    const archivedWrite = await capture(() => patch(older.id, { custom: { owner: 'Ops' } }))
+    expect(codeOf(archivedWrite)).toBe('BAD_REQUEST')
+    expect(reasonOf(archivedWrite)).toBe('inventory.field.archived')
+    expect(detailOf(archivedWrite, 'field')).toBe('Owner')
+    expect((await createAsset(WS_VALUES, { name: 'Made after the field was archived' })).custom).toEqual({})
+    expect((await getAsset(older.id)).custom).toEqual({ site: 'Lisbon', owner: 'Finance' })
+    expect(
+      (await patch(older.id, { custom: { site: null } })).custom,
+      'and it is not demanded either',
+    ).toEqual({
+      owner: 'Finance',
+    })
+  })
+})
+
+/**
+ * Dispositions: the two things a person can say about an item that nothing else in the register
+ * records, and the one way back.
+ *
+ * A disposition wins the status column and touches nothing else — Ada's lost laptop is still Ada's
+ * until somebody takes it back, and a laptop lost at the repairer still has its repair open. Every
+ * test below is one of those two halves, or one of the refusals that keeps "what happened to it"
+ * from quietly settling "who is answerable for it" or "where is it".
+ */
+describe('what somebody said happened to an item', () => {
+  const ctx = () => ({ context: asUser(ALICE, WS_DISPOSE) })
+  const markLost = (assetId: string, note?: string) =>
+    call(inv.assets.markLost, { workspaceId: WS_DISPOSE, assetId, note }, ctx())
+  const retire = (assetId: string, note?: string) =>
+    call(inv.assets.retire, { workspaceId: WS_DISPOSE, assetId, note }, ctx())
+  const reinstate = (assetId: string, note?: string) =>
+    call(inv.assets.reinstate, { workspaceId: WS_DISPOSE, assetId, note }, ctx())
+  const assign = (assetId: string, userId: string) =>
+    call(inv.custody.assign, { workspaceId: WS_DISPOSE, assetId, userId }, ctx())
+  const transfer = (assetId: string, userId: string) =>
+    call(inv.custody.transfer, { workspaceId: WS_DISPOSE, assetId, userId }, ctx())
+  const take = (assetId: string) => call(inv.custody.return, { workspaceId: WS_DISPOSE, assetId }, ctx())
+  const archive = (assetId: string, archived = true) =>
+    call(inv.assets.archive, { workspaceId: WS_DISPOSE, assetId, archived }, ctx())
+  const getAsset = (assetId: string) => call(inv.assets.get, { workspaceId: WS_DISPOSE, assetId }, ctx())
+  const timeline = async (assetId: string) =>
+    (await call(inv.assets.history, { workspaceId: WS_DISPOSE, assetId }, ctx())).items
+  const actionsOf = async (assetId: string) => (await timeline(assetId)).map((e) => e.action)
+  const summary = () => call(inv.stats.summary, { workspaceId: WS_DISPOSE }, ctx())
+  /** The events named `name` about one asset, as the three things a subscriber reads. */
+  const eventsFor = (assetId: string, name: string) =>
+    EVENTS.filter((e) => e.name === name && (e.payload as { assetId?: string }).assetId === assetId).map(
+      (e) => ({ workspaceId: e.workspaceId, actorId: e.actorId, payload: e.payload }),
+    )
+
+  /** Lost while Bob held it, then handed back while still lost. Made in the first test. */
+  let handedBack: string
+  /** Lost while nobody held it. Made in the second test, and reinstated in the fifth. */
+  let freeLost: string
+
+  it('marks a held item lost without taking it off the person holding it, and tells everything that listens', async () => {
+    const item = await createAsset(WS_DISPOSE, { name: 'Ada’s laptop' })
+    await assign(item.id, BOB)
+    handedBack = item.id
+
+    CHANGES.length = 0
+    const lost = await markLost(item.id, 'Left on the 08:15 to Brighton')
+    expect({ status: lost.status, holder: lost.custodianUserId, disposition: lost.disposition }).toEqual({
+      status: 'lost',
+      holder: BOB,
+      disposition: 'lost',
+    })
+    expect(lost.dispositionAt).toBeTruthy()
+    expect(new Date(lost.dispositionAt as string).getTime()).toBeLessThanOrEqual(Date.now())
+    expect(lost.custodySince, 'the custody clock did not move').toBeTruthy()
+
+    // Written by the same transaction, with the note on the event rather than on the asset.
+    const [latest] = await timeline(item.id)
+    expect(latest).toMatchObject({
+      action: 'lost',
+      actorId: ALICE,
+      data: { note: 'Left on the 08:15 to Brighton' },
+    })
+    expect(await actionsOf(item.id)).toEqual(['lost', 'assigned', 'created'])
+
+    // The three announcements, after the commit.
+    expect(eventsFor(item.id, 'inventory.asset.disposed')).toEqual([
+      {
+        workspaceId: WS_DISPOSE,
+        actorId: ALICE,
+        payload: { assetId: item.id, workspaceId: WS_DISPOSE, disposition: 'lost' },
+      },
+    ])
+    expect(
+      CHANGES.map((c) => ({ workspaceId: c.workspaceId, entity: c.entity, id: c.id, op: c.op })),
+    ).toEqual([{ workspaceId: WS_DISPOSE, entity: 'asset', id: item.id, op: 'updated' }])
+    expect(
+      documentFor(item.id)?.attributes,
+      'the search document carries the status that just moved',
+    ).toMatchObject({
+      status: 'lost',
+      custodianUserId: BOB,
+    })
+
+    // The custody trail is untouched: Bob is still answerable for it.
+    const periods = await call(inv.custody.history, { workspaceId: WS_DISPOSE, assetId: item.id }, ctx())
+    expect(periods.map((p) => ({ userId: p.userId, effectiveTo: p.effectiveTo }))).toEqual([
+      { userId: BOB, effectiveTo: null },
+    ])
+  })
+
+  it('cannot be handed to anybody, but can be taken back — and stays lost when it is', async () => {
+    const free = await createAsset(WS_DISPOSE, { name: 'Lost from the cupboard' })
+    await markLost(free.id)
+    freeLost = free.id
+
+    const assigned = await capture(() => assign(free.id, BOB))
+    expect(codeOf(assigned)).toBe('CONFLICT')
+    expect(reasonOf(assigned)).toBe('inventory.custody.disposed')
+    expect((await getAsset(free.id)).custodianUserId, 'refused whole: no period opened').toBeNull()
+
+    const passedOn = await capture(() => transfer(handedBack, ALICE))
+    expect(codeOf(passedOn)).toBe('CONFLICT')
+    expect(reasonOf(passedOn)).toBe('inventory.custody.disposed')
+    expect((await getAsset(handedBack)).custodianUserId, 'still Bob’s').toBe(BOB)
+
+    // The person answerable for a lost laptop has to be able to stop being answerable for it.
+    const { asset: returned } = await take(handedBack)
+    expect({
+      status: returned.status,
+      holder: returned.custodianUserId,
+      disposition: returned.disposition,
+    }).toEqual({
+      status: 'lost',
+      holder: null,
+      disposition: 'lost',
+    })
+    expect(await actionsOf(handedBack)).toEqual(['returned', 'lost', 'assigned', 'created'])
+  })
+
+  it('cannot be sent for repair', async () => {
+    const refusal = await capture(() => sendForRepair(WS_DISPOSE, freeLost, { summary: 'Screen' }))
+    expect(codeOf(refusal)).toBe('CONFLICT')
+    expect(reasonOf(refusal)).toBe('inventory.repair.disposed')
+    const { items } = await call(inv.repairs.list, { workspaceId: WS_DISPOSE, assetId: freeLost }, ctx())
+    expect(items, 'nothing was written').toEqual([])
+  })
+
+  it('cannot be lost twice, or written off once it is lost', async () => {
+    for (const attempt of [() => markLost(freeLost), () => retire(freeLost)]) {
+      const refusal = await capture(attempt)
+      expect(codeOf(refusal)).toBe('CONFLICT')
+      expect(reasonOf(refusal)).toBe('inventory.asset.already_disposed')
+    }
+    expect(await actionsOf(freeLost), 'and the timeline records one loss').toEqual(['lost', 'created'])
+  })
+
+  it('reinstates to whatever custody says, re-recording no handover', async () => {
+    // Held: found under the desk, and Bob's again without anybody handing it over a second time.
+    const held = await createAsset(WS_DISPOSE, { name: 'Found under the desk' })
+    await assign(held.id, BOB)
+    await markLost(held.id)
+    expect(await statusOf(WS_DISPOSE, held.id)).toBe('lost')
+
+    CHANGES.length = 0
+    const back = await reinstate(held.id, 'It was under the desk')
+    expect({
+      status: back.status,
+      holder: back.custodianUserId,
+      disposition: back.disposition,
+      dispositionAt: back.dispositionAt,
+    }).toEqual({ status: 'assigned', holder: BOB, disposition: null, dispositionAt: null })
+    const [latest] = await timeline(held.id)
+    expect(latest).toMatchObject({
+      action: 'reinstated',
+      actorId: ALICE,
+      data: { from: 'lost', note: 'It was under the desk' },
+    })
+    expect(await actionsOf(held.id)).toEqual(['reinstated', 'lost', 'assigned', 'created'])
+    expect(eventsFor(held.id, 'inventory.asset.reinstated')).toEqual([
+      {
+        workspaceId: WS_DISPOSE,
+        actorId: ALICE,
+        payload: { assetId: held.id, workspaceId: WS_DISPOSE, disposition: 'lost' },
+      },
+    ])
+    expect(CHANGES.map((c) => ({ entity: c.entity, id: c.id, op: c.op }))).toEqual([
+      { entity: 'asset', id: held.id, op: 'updated' },
+    ])
+    expect(documentFor(held.id)?.attributes).toMatchObject({ status: 'assigned', custodianUserId: BOB })
+
+    // Unheld: back in stock.
+    const free = await reinstate(freeLost)
+    expect({ status: free.status, holder: free.custodianUserId, disposition: free.disposition }).toEqual({
+      status: 'in_stock',
+      holder: null,
+      disposition: null,
+    })
+    expect((await timeline(freeLost))[0]?.data).toEqual({ from: 'lost' })
+  })
+
+  it('refuses reinstating an item that is in service, because "reinstated" has to mean something', async () => {
+    const never = await createAsset(WS_DISPOSE, { name: 'Never lost' })
+    for (const assetId of [never.id, freeLost]) {
+      const refusal = await capture(() => reinstate(assetId))
+      expect(codeOf(refusal)).toBe('CONFLICT')
+      expect(reasonOf(refusal)).toBe('inventory.asset.not_disposed')
+    }
+    expect(await actionsOf(never.id)).toEqual(['created'])
+  })
+
+  it('refuses writing off something somebody is holding', async () => {
+    const held = await createAsset(WS_DISPOSE, { name: 'Bob’s monitor' })
+    await assign(held.id, BOB)
+    const refusal = await capture(() => retire(held.id))
+    expect(codeOf(refusal)).toBe('CONFLICT')
+    expect(reasonOf(refusal)).toBe('inventory.asset.still_held')
+    expect((await getAsset(held.id)).disposition).toBeNull()
+  })
+
+  it('refuses writing off something that is away for repair, while the workspace records repairs', async () => {
+    const away = await createAsset(WS_DISPOSE, { name: 'At the workshop' })
+    const { repair } = await sendForRepair(WS_DISPOSE, away.id, { summary: 'Hinge' })
+    const refusal = await capture(() => retire(away.id))
+    expect(codeOf(refusal)).toBe('CONFLICT')
+    expect(reasonOf(refusal)).toBe('inventory.asset.under_repair')
+    expect(await statusOf(WS_DISPOSE, away.id)).toBe('under_repair')
+
+    // Logged back, the two-step instruction the refusal gave can be followed.
+    await completeRepair(WS_DISPOSE, repair.id)
+    expect((await retire(away.id)).status).toBe('retired')
+  })
+
+  it('writes off a free item, tells everything that listens, and then lets it be archived', async () => {
+    const item = await createAsset(WS_DISPOSE, { name: 'Sold to a colleague' })
+    CHANGES.length = 0
+    const retired = await retire(item.id, 'Sold for €120')
+    expect({
+      status: retired.status,
+      holder: retired.custodianUserId,
+      disposition: retired.disposition,
+      archivedAt: retired.archivedAt,
+    }).toEqual({ status: 'retired', holder: null, disposition: 'retired', archivedAt: null })
+    expect(retired.dispositionAt).toBeTruthy()
+    const [latest] = await timeline(item.id)
+    expect(latest).toMatchObject({ action: 'written_off', actorId: ALICE, data: { note: 'Sold for €120' } })
+    expect(eventsFor(item.id, 'inventory.asset.disposed')).toEqual([
+      {
+        workspaceId: WS_DISPOSE,
+        actorId: ALICE,
+        payload: { assetId: item.id, workspaceId: WS_DISPOSE, disposition: 'retired' },
+      },
+    ])
+    expect(CHANGES.map((c) => ({ entity: c.entity, id: c.id, op: c.op }))).toEqual([
+      { entity: 'asset', id: item.id, op: 'updated' },
+    ])
+    expect(documentFor(item.id)?.attributes).toMatchObject({ status: 'retired' })
+    expect(
+      (await listAssets(WS_DISPOSE, { status: 'retired', limit: 200 })).items.map((a) => a.id),
+    ).toContain(item.id)
+
+    // Retired is not archived: two steps, each meaning something, and the second is called what it is.
+    const archived = await archive(item.id)
+    expect({
+      archivedAt: archived.archivedAt,
+      disposition: archived.disposition,
+      status: archived.status,
+    }).toEqual({
+      archivedAt: expect.any(String),
+      disposition: 'retired',
+      status: 'retired',
+    })
+    expect(await actionsOf(item.id)).toEqual(['archived', 'written_off', 'created'])
+
+    // Nothing can be said about an archived item until it is restored.
+    for (const attempt of [() => markLost(item.id), () => retire(item.id), () => reinstate(item.id)]) {
+      const refusal = await capture(attempt)
+      expect(codeOf(refusal)).toBe('CONFLICT')
+      expect(reasonOf(refusal)).toBe('inventory.asset.archived')
+    }
+    const plain = await createAsset(WS_DISPOSE, { name: 'Archived in service' })
+    await archive(plain.id)
+    for (const attempt of [() => markLost(plain.id), () => retire(plain.id)])
+      expect(reasonOf(await capture(attempt))).toBe('inventory.asset.archived')
+  })
+
+  it('can be lost at the repairer, and stays lost when the repair is logged back', async () => {
+    const item = await createAsset(WS_DISPOSE, { name: 'Lost by the workshop' })
+    const { repair } = await sendForRepair(WS_DISPOSE, item.id, { summary: 'Battery' })
+    expect(await statusOf(WS_DISPOSE, item.id)).toBe('under_repair')
+
+    const lost = await markLost(item.id, 'The courier never arrived')
+    expect(lost.status).toBe('lost')
+    const { items } = await call(inv.repairs.list, { workspaceId: WS_DISPOSE, assetId: item.id }, ctx())
+    expect(
+      items.map((r) => r.returnedOn),
+      'the repair stays open — nothing came back',
+    ).toEqual([null])
+
+    // Whatever came back, the disposition still wins the column until somebody says otherwise.
+    const { asset: after } = await completeRepair(WS_DISPOSE, repair.id)
+    expect({ status: after.status, disposition: after.disposition }).toEqual({
+      status: 'lost',
+      disposition: 'lost',
+    })
+    expect((await reinstate(item.id)).status, 'and reinstated it reads from the other facts').toBe('in_stock')
+  })
+
+  it('is not counted as available to hand out, and is counted under its own status', async () => {
+    const before = await summary()
+    const a = await createAsset(WS_DISPOSE, { name: 'Counted as lost' })
+    const b = await createAsset(WS_DISPOSE, { name: 'Counted as retired' })
+    await markLost(a.id)
+    await retire(b.id)
+    const after = await summary()
+    expect({
+      total: after.total,
+      unassigned: after.unassigned,
+      lost: after.byStatus.lost,
+      retired: after.byStatus.retired,
+      in_stock: after.byStatus.in_stock,
+    }).toEqual({
+      total: before.total + 2,
+      // Two more live rows nobody is holding, and not one more available to hand out.
+      unassigned: before.unassigned,
+      lost: before.byStatus.lost + 1,
+      retired: before.byStatus.retired + 1,
+      in_stock: before.byStatus.in_stock,
+    })
+  })
+
+  it('is left alone by the nightly reconciliation, in both directions', async () => {
+    const lostBefore = (await listAssets(WS_DISPOSE, { status: 'lost', limit: 200 })).items
+    const retiredBefore = (await listAssets(WS_DISPOSE, { status: 'retired', limit: 200 })).items
+    expect(
+      lostBefore.length + retiredBefore.length,
+      'there is something for it to leave alone',
+    ).toBeGreaterThan(0)
+
+    // Nothing in this workspace is out of step, so the sweep finds nothing — and a disposed row is
+    // not a candidate whichever way the repairs switch points.
+    expect(await reconcileStatuses(kernel, WS_DISPOSE, true)).toBe(0)
+    expect(await reconcileStatuses(kernel, WS_DISPOSE, false)).toBe(0)
+
+    const stillLost = (await listAssets(WS_DISPOSE, { status: 'lost', limit: 200 })).items
+    const stillRetired = (await listAssets(WS_DISPOSE, { status: 'retired', limit: 200 })).items
+    expect(stillLost.map((a) => [a.id, a.updatedAt])).toEqual(lostBefore.map((a) => [a.id, a.updatedAt]))
+    expect(stillRetired.map((a) => [a.id, a.updatedAt])).toEqual(
+      retiredBefore.map((a) => [a.id, a.updatedAt]),
+    )
   })
 })

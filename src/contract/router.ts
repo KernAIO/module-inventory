@@ -12,8 +12,13 @@ import {
   CategoryInput,
   CustodyPeriod,
   CustodyResult,
+  DispositionInput,
+  FieldCreateInput,
+  FieldDef,
+  FieldPatchInput,
   InventoryStats,
   MAX_LIVE_CATEGORIES,
+  MAX_LIVE_FIELDS,
   RepairInput,
   RepairListItem,
   RepairPatchInput,
@@ -78,6 +83,85 @@ export const inventoryContract = {
       .route({ method: 'GET', path: '/assets/{assetId}/history', tags: t })
       .input(ws.extend({ assetId: z.uuid(), ...PageInput.shape }))
       .output(page(AssetHistoryEntry)),
+
+    /**
+     * The two things somebody says about an item that nothing else records, and the one way back.
+     *
+     * Three verbs rather than a `setStatus`, for the reason custody has four: "we lost it" and
+     * "we are done with it" are different facts with different refusals — an item somebody is
+     * holding can be lost but cannot be retired, because retiring it would quietly release whoever
+     * is answerable for it. One procedure taking a status would answer both by doing whatever the
+     * row happened to allow.
+     *
+     * All three take `inventory.asset.manage`: they are statements about the record, and the
+     * money-shaped consequences (a write-off) are a workspace's own to gate with a custom role.
+     */
+    /** Nobody knows where it is. Allowed while somebody holds it — they are still answerable. */
+    markLost: baseContract
+      .route({ method: 'POST', path: '/assets/{assetId}/lost', tags: t })
+      .input(ws.extend({ assetId: z.uuid(), ...DispositionInput.shape }))
+      .output(Asset),
+    /**
+     * The company is done with it: sold, scrapped, written off. Refuses an item somebody is holding
+     * (take it back first) and one that is away for repair (log it back first), for the reasons
+     * `archive` refuses the same two — nothing may quietly settle who is answerable or where the
+     * thing is.
+     */
+    retire: baseContract
+      .route({ method: 'POST', path: '/assets/{assetId}/retire', tags: t })
+      .input(ws.extend({ assetId: z.uuid(), ...DispositionInput.shape }))
+      .output(Asset),
+    /**
+     * It turned up, or the write-off was a mistake. Clears the disposition and hands `status` back
+     * to custody and repairs, so an item found under a desk reads `assigned` again without anybody
+     * re-recording the handover. Refuses an item that has no disposition to clear.
+     */
+    reinstate: baseContract
+      .route({ method: 'POST', path: '/assets/{assetId}/reinstate', tags: t })
+      .input(ws.extend({ assetId: z.uuid(), ...DispositionInput.shape }))
+      .output(Asset),
+  },
+
+  /**
+   * A workspace's own fields on an asset — a cost centre, a supplier reference, a MAC address.
+   *
+   * Not behind a capability, and deliberately: a workspace that defines no field sees nothing — no
+   * section on the form, no rows on the panel — so the feature switches itself off by being empty,
+   * and a second switch would be one that changes nothing. Reading rides `inventory.asset.view`
+   * because the asset form and the panel need the definitions to render a value; writing is
+   * `inventory.field.manage`, workspace configuration like categories.
+   *
+   * Not paged, like categories, and for the same reason: every field has to be on the form anyway.
+   */
+  fields: {
+    list: baseContract
+      .route({ method: 'GET', path: '/fields', tags: t })
+      .input(ws.extend({ archived: z.boolean().default(false) }))
+      .output(z.array(FieldDef)),
+    create: baseContract
+      .route({ method: 'POST', path: '/fields', tags: t })
+      .input(ws.extend(FieldCreateInput.shape))
+      .output(FieldDef),
+    /**
+     * Everything but the key and the type, which a value already written cannot survive changing.
+     *
+     * Renaming an option keeps the old word on every asset that chose it — the value *is* the word.
+     * Removing one does the same. The settings screen says so beside the list.
+     */
+    update: baseContract
+      .route({ method: 'PATCH', path: '/fields/{fieldId}', tags: t })
+      .input(ws.extend({ fieldId: z.uuid(), ...FieldPatchInput.shape }))
+      .output(FieldDef),
+    /** Archive, not delete — values written under the key stay readable — and the same procedure restores. */
+    archive: baseContract
+      .route({ method: 'POST', path: '/fields/{fieldId}/archive', tags: t })
+      .input(ws.extend({ fieldId: z.uuid(), archived: z.boolean().default(true) }))
+      .output(FieldDef),
+    /** The whole live sequence, exactly as `categories.reorder` takes it, with the same refusals. */
+    reorder: baseContract
+      .route({ method: 'POST', path: '/fields/reorder', tags: t })
+      .input(ws.extend({ fieldIds: z.array(z.uuid()).min(1).max(MAX_LIVE_FIELDS) }))
+      .output(z.array(FieldDef)),
   },
 
   /**

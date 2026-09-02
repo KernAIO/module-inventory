@@ -158,13 +158,18 @@ const BUILT = new Set([
     'assigned',
     'transferred',
     'returned',
-    'retired',
+    'archived',
     'restored',
+    'lost',
+    'written_off',
+    'reinstated',
     'repair_logged',
     'repair_completed',
     'attachment_added',
     'attachment_removed',
   ].map((a) => `history_${a}`),
+  // The label for a field's type, `t(`field_type_${type}`)`, on the fields settings page.
+  ...['text', 'number', 'date', 'select', 'multiselect', 'checkbox', 'url'].map((f) => `field_type_${f}`),
 ])
 
 describe('every key is one something asks for', () => {

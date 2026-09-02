@@ -37,6 +37,15 @@ export const inventoryKeys = {
   /** One asset's files, its repairs' included — the panel groups them, so there is one key. */
   assetAttachments: (ws: string, id: string) => ['inventory', 'asset', ws, id, 'attachments'] as const,
   /**
+   * What one person is holding — the "also holding" line under a custodian's name.
+   *
+   * Under the **asset** prefix, one segment deep, because it is a list of assets: every handover
+   * that changes it already announces `entity: 'asset'`. `'held-by'` cannot collide with
+   * `asset(ws, id)` — that segment is always a uuid — and the user id after it keeps two people's
+   * lists apart.
+   */
+  heldBy: (ws: string, userId: string) => ['inventory', 'asset', ws, 'held-by', userId] as const,
+  /**
    * The workspace's repairs, which belong to no single asset — the "what is away right now" card.
    *
    * Its own entity, because it cannot hang under one asset's key: `src/server/router.ts` therefore
@@ -58,4 +67,10 @@ export const inventoryKeys = {
    * touches every asset row on screen, and `src/server/router.ts` therefore emits both.
    */
   categories: (ws: string, archived = false) => ['inventory', 'category', ws, { archived }] as const,
+  /**
+   * The workspace's own field definitions. Its own entity — `src/server/router.ts` announces a
+   * change as `entity: 'field'` — because a definition is read by the asset form, the detail panel
+   * and the settings page at once, and none of those is under any one asset's key.
+   */
+  fields: (ws: string, archived = false) => ['inventory', 'field', ws, { archived }] as const,
 }

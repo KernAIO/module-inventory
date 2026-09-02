@@ -32,6 +32,23 @@ export const inventoryEvents = {
     z.object({ assetId: z.uuid(), workspaceId: WorkspaceId }),
   ),
   /**
+   * Somebody said the item is lost, or that the company is done with it — and the way back.
+   *
+   * One event for both dispositions, carrying which, because a subscriber cares that the item
+   * stopped being in service and can read `disposition` for why; two events would make every
+   * subscriber that cares about either subscribe to both. `reinstated` is its own, because it is
+   * the opposite fact: something outside this module wants to tell the holder their laptop turned
+   * up, and something else wants to strike it off an insurance claim.
+   */
+  assetDisposed: defineEvent(
+    'inventory.asset.disposed',
+    z.object({ assetId: z.uuid(), workspaceId: WorkspaceId, disposition: z.enum(['lost', 'retired']) }),
+  ),
+  assetReinstated: defineEvent(
+    'inventory.asset.reinstated',
+    z.object({ assetId: z.uuid(), workspaceId: WorkspaceId, disposition: z.enum(['lost', 'retired']) }),
+  ),
+  /**
    * One event for all three of assign, transfer and return, because a subscriber cares that the
    * answer to "who has it" moved and not by which verb.
    *

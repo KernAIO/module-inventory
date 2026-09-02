@@ -141,6 +141,19 @@ export const assets = schema.table(
     /** Denormalized from `custody_periods`, which stays authoritative for history. */
     custodianUserId: uuid('custodian_user_id'),
     custodySince: ts('custody_since'),
+    /**
+     * `Disposition` in the contract: `lost` or `retired`, or null for an item still in service.
+     *
+     * Its own column rather than a value written into `status`, because `status` is a derivation
+     * and this is a decision: the reconciliation sweep recomputes `status` from the facts, and a
+     * decision has to be one of the facts it reads or the sweep would undo it. `deriveStatus` reads
+     * it first. Text, not a pg enum, for the reason `status` gives.
+     *
+     * Both nullable and added in `0009`, so the image before this one reads the table straight
+     * past them.
+     */
+    disposition: text('disposition'),
+    dispositionAt: ts('disposition_at'),
     serialNumber: text('serial_number'),
     location: text('location'),
     purchasedOn: date('purchased_on'),
@@ -187,6 +200,13 @@ export const assets = schema.table(
  * Workspace-defined extra fields, copied from tracker's `field_defs` (which cannot be shared:
  * cross-schema joins are what the module boundary exists to prevent). The `key` **is** the key a
  * value lives under in `assets.custom`, hence unique per workspace whatever the category scope.
+ *
+ * Three columns here are in the table and not in the contract — `default_value`, `searchable` and
+ * `show_in_list`. They shipped in `0000` ahead of any procedure, and the procedures that arrived
+ * (`fields.*`) do not read them: a default is a value the form fills in, which is the form's job;
+ * search and a list column are features with their own screens. Nullable or defaulted, so nothing
+ * writes them and nothing is broken by their being there; they go one release after something
+ * decides to use them or not.
  */
 export const fieldDefs = schema.table(
   'field_defs',
@@ -197,7 +217,9 @@ export const fieldDefs = schema.table(
     key: text('key').notNull(),
     name: text('name').notNull(),
     description: text('description'),
-    type: text('type').notNull(), // text | number | date | select | multiselect | checkbox | url
+    /** `FieldType` in the contract. Text, not a pg enum, for the reason `assets.status` gives. */
+    type: text('type').notNull(),
+    /** The choices of a `select` or `multiselect`, in order; empty for every other type. */
     options: jsonb('options').$type<string[]>(),
     defaultValue: jsonb('default_value'),
     required: boolean('required').notNull().default(false),

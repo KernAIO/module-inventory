@@ -18,6 +18,12 @@ export interface RepairState {
   open: boolean
   /** The workspace has taken the item out of the register; the server refuses a new repair. */
   archived: boolean
+  /**
+   * Somebody said it is lost or retired — `assets.disposition` is set. The server refuses a *new*
+   * repair with `inventory.repair.disposed`; a repair already open stays open, because a repairer
+   * can lose a thing and the row that says it went there is still true.
+   */
+  disposed: boolean
   /** This person holds `inventory.repair.manage`. */
   may: boolean
 }
@@ -26,13 +32,14 @@ export interface RepairState {
  * What to offer, in the order the controls appear.
  *
  * Empty for somebody without the permission — hide what a person may never do — and empty for an
- * archived item with nothing open, where the section says *why* in one sentence instead. An
- * archived item whose repair is still open keeps `complete` and `edit`: archiving is refused while
- * a repair is open, so the only way to be in that state is to have archived it first and opened the
- * repair never — but if the data ever says otherwise, the way out has to stay reachable.
+ * archived or disposed item with nothing open, where the section says *why* in one sentence
+ * instead. An item whose repair is still open keeps `complete` and `edit` whatever else is true of
+ * it: archiving is refused while a repair is open, so an archived item with one should be
+ * unreachable, but a lost one with one is ordinary — the repairer lost it — and either way the way
+ * out has to stay reachable.
  */
 export function repairActions(state: RepairState): RepairAction[] {
   if (!state.may) return []
   if (state.open) return ['complete', 'edit']
-  return state.archived ? [] : ['create']
+  return state.archived || state.disposed ? [] : ['create']
 }

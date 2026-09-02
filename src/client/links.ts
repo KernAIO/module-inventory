@@ -19,6 +19,12 @@ export const INVENTORY_PATH = '/inventory'
 export const ASSET_PARAM = 'asset'
 
 /**
+ * The parameter `AssetsPage` reads to show one person's holdings — the return list an offboarding
+ * notification links to, and the list the panel's "also holding" line opens.
+ */
+export const CUSTODIAN_PARAM = 'custodian'
+
+/**
  * The list, scoped to a workspace.
  *
  * The shell mounts every module route under `/<workspaceSlug>`, so a link built without the slug
