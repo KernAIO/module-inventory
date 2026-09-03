@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1
+
+### Patch Changes
+
+- test(inventory): bless the permission matrix
+
 ## 0.5.0
 
 ### Minor Changes
