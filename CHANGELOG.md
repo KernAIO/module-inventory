@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.3
+
+### Patch Changes
+
+- chore: check the packed tarball can resolve its own imports
+
 ## 0.6.2
 
 ### Patch Changes
