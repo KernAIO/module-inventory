@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.6
+
+### Patch Changes
+
+- docs(rls): drop the version numbers from the 0010 comments
+
 ## 0.5.5
 
 ### Patch Changes
