@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.4
+
+### Patch Changes
+
+- test: fail on a tenant table with no policy, not only an unforced one
+
 ## 0.5.3
 
 ### Patch Changes
