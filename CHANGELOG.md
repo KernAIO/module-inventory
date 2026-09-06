@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.2
+
+### Patch Changes
+
+- chore(renovate): drop dead @kernhq automerge rule
+
 ## 0.6.1
 
 ### Patch Changes
