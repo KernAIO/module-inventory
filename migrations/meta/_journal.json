@@ -71,6 +71,13 @@
       "when": 1788382253407,
       "tag": "0009_disposition",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1788689121145,
+      "tag": "0010_workspace_registry_all_binding",
+      "breakpoints": true
     }
   ]
 }

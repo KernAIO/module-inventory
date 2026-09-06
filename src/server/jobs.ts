@@ -2,7 +2,7 @@ import type { JobDef, Kernel } from '@kernhq/kernel'
 import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm'
 import { MODULE_ID } from '../contract/models.js'
 import { InventorySettings } from '../contract/settings.js'
-import { assets, repairs, workspaces } from './schema.js'
+import { ALL_WORKSPACES, assets, repairs, workspaces } from './schema.js'
 import { membersWithPermission } from './services/audience.js'
 import { inventoryServices } from './services/index.js'
 import { assetUrl } from './services/search.js'
@@ -52,18 +52,25 @@ function shiftDays(date: string, days: number): string {
  * `schema.ts` gives at `workspaces`: a sweep that depends on a broker round trip fails whenever
  * core is briefly away, which is exactly the condition an unattended overnight job has to survive.
  *
- * **Unbound on purpose, and the table's policy is what makes that legal.** A scheduler is woken by a
- * clock, so there is no workspace to bind to and `app.workspace_id` is unset here by definition. The
- * per-workspace policy every tenant table carries therefore matches nothing, and `workspaces` — like
- * every other table in this schema — carries `force row level security`, which subjects the schema's
- * **owner** to its policies as well. So this read answered *zero rows, silently, for ever* on any
- * deployment whose application role is not a superuser, and it would have gone on doing so with no
- * error to notice. `0006_workspace_registry_read.sql` adds the one policy that admits it: a select
- * policy on this table alone, for a session with no workspace bound. It is exported so the test
- * suite can run the real enumeration rather than a query that resembles it.
+ * **Bound to `'*'`, and the table's policy is what makes that legal.** A scheduler is woken by a
+ * clock, so there is no one workspace to bind to. The per-workspace policy every tenant table
+ * carries therefore matches nothing, and `workspaces` — like every other table in this schema —
+ * carries `force row level security`, which subjects the schema's **owner** to its policies as well.
+ * So this read answered *zero rows, silently, for ever* on any deployment whose application role is
+ * not a superuser, and it would have gone on doing so with no error to notice.
+ *
+ * The sentinel is what the read is bound to rather than nothing, which is the difference between a
+ * cross-workspace read somebody asked for and one nobody noticed: a policy admitting an *unbound*
+ * transaction makes forgetting to bind a leak, and this one makes it a refusal.
+ * `0010_workspace_registry_all_binding.sql` adds the policy that admits it — `for select`, on this
+ * table alone — and `0006`'s unbound policy is still there for the image being replaced during a
+ * rolling deploy. Exported so the test suite can run the real enumeration rather than a query that
+ * resembles it.
  */
 export async function activeWorkspaces(kernel: Kernel): Promise<string[]> {
-  const rows = await kernel.database.db.select({ id: workspaces.workspaceId }).from(workspaces)
+  const rows = await kernel.database.withWorkspace(ALL_WORKSPACES, (tx) =>
+    tx.select({ id: workspaces.workspaceId }).from(workspaces),
+  )
   return rows.map((row) => row.id)
 }
 

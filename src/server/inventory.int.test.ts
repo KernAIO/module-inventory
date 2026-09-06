@@ -20,6 +20,7 @@ import { inventoryModule } from './index.js'
 import { activeWorkspaces, reconcileStatuses } from './jobs.js'
 import { inventoryRouter } from './router.js'
 import {
+  ALL_WORKSPACES,
   assetHistory,
   assets,
   categories as categoriesTable,
@@ -830,37 +831,72 @@ describe('row-level security, as a role that cannot bypass it', () => {
    * The scheduler's enumeration, run as the role a deployment actually uses.
    *
    * `mod_inventory.workspaces` is the registry both nightly sweeps start from, and a cron handler is
-   * woken by a clock — so it has no workspace and `app.workspace_id` is unset for it by definition.
-   * The table's per-workspace policy therefore matched nothing, and `force row level security`
-   * subjects the schema's **owner** to its policies as well: only a superuser is exempt. So this read
-   * answered zero rows on any ordinary deployment. No error, no warning — both sweeps simply found
-   * nothing to do, every night, and the development database is a superuser, which is exactly why
-   * nothing noticed.
+   * woken by a clock — so there is no one workspace for it to bind. The table's per-workspace policy
+   * therefore matched nothing, and `force row level security` subjects the schema's **owner** to its
+   * policies as well: only a superuser is exempt. So this read answered zero rows on any ordinary
+   * deployment. No error, no warning — both sweeps simply found nothing to do, every night, and the
+   * development database is a superuser, which is exactly why nothing noticed.
    *
-   * The real `activeWorkspaces` is called rather than a query that resembles it, against a drizzle
-   * handle over this role's own connection. A test that reproduced the SQL by hand would pass on a
-   * job that had since started reading something else.
+   * The real `activeWorkspaces` is called rather than a query that resembles it, against a stand-in
+   * kernel whose `withWorkspace` does what the real one does — a transaction with
+   * `set_config('app.workspace_id', …, true)` — over this role's own connection. A test that
+   * reproduced the SQL by hand would pass on a job that had since started reading something else,
+   * and one that skipped the `set_config` would not exercise the sentinel at all.
    */
-  it('lets the scheduler enumerate every registered workspace, as a role that cannot bypass RLS', async () => {
-    await plain.query('reset app.workspace_id')
-    const asPlainRole = { database: { db: drizzle({ client: plain }) } } as unknown as Kernel
+  const asPlainRole = () =>
+    ({
+      database: {
+        db: drizzle({ client: plain }),
+        withWorkspace: async <T>(workspaceId: string | null, fn: (tx: unknown) => Promise<T>) => {
+          await plain.query('begin')
+          try {
+            await plain.query(`select set_config('app.workspace_id', $1, true)`, [workspaceId ?? ''])
+            const out = await fn(drizzle({ client: plain }))
+            await plain.query('commit')
+            return out
+          } catch (err) {
+            await plain.query('rollback')
+            throw err
+          }
+        },
+      },
+    }) as unknown as Kernel
 
-    const ids = await activeWorkspaces(asPlainRole)
+  it('lets the scheduler enumerate every registered workspace, as a role that cannot bypass RLS', async () => {
+    const ids = await activeWorkspaces(asPlainRole())
     expect(ids, 'a sweep that finds no workspaces has nothing to sweep, silently and for ever').toContain(
       WS_REGISTRY,
     )
+  })
 
-    // And nothing else opened up: the same unbound session still sees no tenant data at all.
+  /**
+   * The half that proves the sentinel widened nothing.
+   *
+   * `'*'` is admitted by one `for select` policy on one table. Every other policy in this schema
+   * compares `workspace_id::text` against the setting, and no uuid is `*`, so the same binding that
+   * enumerates the registry must still see no tenant data at all.
+   */
+  it('shows a session bound to the sentinel nothing but the registry', async () => {
+    await plain.query(`set app.workspace_id = '${ALL_WORKSPACES}'`)
+    expect(await count('select count(*) as n from mod_inventory.workspaces')).toBeGreaterThan(0)
     expect(await count('select count(*) as n from mod_inventory.assets')).toBe(0)
     expect(await count('select count(*) as n from mod_inventory.custody_periods')).toBe(0)
+    expect(await count('select count(*) as n from mod_inventory.asset_history')).toBe(0)
   })
 
   it('still shows a workspace-bound session only its own registry row', async () => {
     await plain.query(`set app.workspace_id = '${WS_A}'`)
     expect(
       await count(`select count(*) as n from mod_inventory.workspaces where workspace_id = '${WS_REGISTRY}'`),
-      'the extra policy is for a session with no workspace, and widens nothing for one that has one',
+      'the sentinel policy is for a read across every workspace, and widens nothing for one bound to a workspace',
     ).toBe(0)
+
+    // And the reverse, so a policy that simply hid every registry row cannot pass this: the
+    // registered workspace, bound to itself, sees exactly its own row.
+    await plain.query(`set app.workspace_id = '${WS_REGISTRY}'`)
+    expect(
+      await count(`select count(*) as n from mod_inventory.workspaces where workspace_id = '${WS_REGISTRY}'`),
+    ).toBe(1)
   })
 })
 
@@ -4007,7 +4043,12 @@ describe('the nightly sweeps', () => {
   })
 
   it('never touches a workspace that has not been registered', async () => {
-    const rows = await kernel.database.db.select({ id: workspaces.workspaceId }).from(workspaces)
+    // The sentinel, because this asks the registry the same question the sweep asks it. Reaching
+    // for the unbound handle would pass here — the suite connects as a superuser — while modelling
+    // a read the module no longer performs.
+    const rows = await kernel.database.withWorkspace(ALL_WORKSPACES, (tx) =>
+      tx.select({ id: workspaces.workspaceId }).from(workspaces),
+    )
     const registered = new Set(rows.map((r) => r.id))
     expect(registered.has(WS_SWEEP)).toBe(true)
     // WS_A is where most of this suite lives and has assets with warranties; it is deliberately not

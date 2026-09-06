@@ -46,23 +46,39 @@ const updated = () => ts('updated_at').notNull().defaultNow()
  * and when a workspace is created. `module-tracker` keeps the same table for the same reason.
  *
  * **It carries `workspace_id`, so it is a tenant table and has a policy like every other** — and the
- * one reader that cannot honour that policy is the enumeration itself, because `app.workspace_id` is
- * unset in a job by definition. That was left resting on "the connection is the schema's owner, and
- * an owner bypasses RLS", which is **false here**: every table in this schema carries `force row
- * level security`, and forcing it subjects the owner to the policies too. So `select workspace_id
- * from workspaces` with no workspace bound answered zero rows — not an error, not a warning, simply
+ * one reader that cannot honour that policy is the enumeration itself, because a job has no request
+ * to derive a workspace from. That was left resting on "the connection is the schema's owner, and an
+ * owner bypasses RLS", which is **false here**: every table in this schema carries `force row level
+ * security`, and forcing it subjects the owner to the policies too. So `select workspace_id from
+ * workspaces` with no workspace bound answered zero rows — not an error, not a warning, simply
  * nothing to sweep, every night, for ever.
  *
- * `0006_workspace_registry_read.sql` is the fix and it is scoped as narrowly as the problem: one
- * extra `for select` policy, on this table only, admitting a session that has **no** workspace bound.
- * A request-bound session still sees exactly its own row, and this table holds nothing but workspace
- * ids anyway — it is the module's own bookkeeping, not tenant data anybody reads. Added in `0004`,
- * because 0.2.0 is published.
+ * The enumeration binds `ALL_WORKSPACES` and `0010_workspace_registry_all_binding.sql` is the policy
+ * that admits it: one extra `for select` policy, on this table only. A request-bound session still
+ * sees exactly its own row, and this table holds nothing but workspace ids anyway — it is the
+ * module's own bookkeeping, not tenant data anybody reads.
+ *
+ * `0006_workspace_registry_read.sql` solved the same problem by admitting a session with **no**
+ * workspace bound, and its policy is still in place because 0.5.3 is published and enumerates this
+ * table unbound. `0010`'s header says which release may drop it and why not before then.
  */
 export const workspaces = schema.table('workspaces', {
   workspaceId: uuid('workspace_id').primaryKey(),
   createdAt: created(),
 })
+
+/**
+ * The binding a read across every workspace at once takes, admitted by `workspaces_all_read`.
+ *
+ * One table in this schema legitimately serves every workspace at once — the registry above, which
+ * the nightly sweeps enumerate — and the alternative to a sentinel is a policy that admits a
+ * transaction with nothing bound, which turns *forgetting* to bind into a leak rather than a
+ * refusal. `module-chat` and `module-mail` both spell it this way for their own instance-wide reads.
+ *
+ * It admits nothing else: `workspaces_all_read` is `for select` and on this table only, and every
+ * other policy here compares `workspace_id::text` against the setting, which no uuid can equal.
+ */
+export const ALL_WORKSPACES = '*'
 
 export const counters = schema.table(
   'counters',

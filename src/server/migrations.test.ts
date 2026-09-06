@@ -44,9 +44,9 @@ let db: pg.Client
  * with the reason and the code that keeps them safe.
  *
  * It is empty, and that is deliberate rather than incidental: `workspaces` is the registry the two
- * nightly sweeps enumerate — the shape `module-tracker` leaves unpolicied — and `0006` gave it a
- * second `for select` policy admitting an unbound session instead of leaving it outside RLS. The
- * note above `TENANT_TABLES` in `schema.ts` says so in as many words.
+ * nightly sweeps enumerate — the shape `module-tracker` leaves unpolicied — and it was given an
+ * extra `for select` policy, admitting the `'*'` binding a sweep takes, instead of being left
+ * outside RLS. The note above `TENANT_TABLES` in `schema.ts` says so in as many words.
  *
  * Adding a name here is a decision somebody records, not a way to make a red test green: a table
  * that belongs here is one whose isolation is enforced somewhere a reader can go and look at.
@@ -238,15 +238,22 @@ describe('the migration folder', () => {
     expect(rows[0]?.convalidated, 'a validating check would fail the upgrade on a row it found').toBe(false)
   })
 
-  it('lets a session with no workspace read the registry the sweeps enumerate', async () => {
+  it('lets a scheduler read the registry the sweeps enumerate', async () => {
     /**
-     * The one table in this schema that a scheduler reads unbound.
+     * The one table in this schema a scheduler reads across every workspace at once.
      *
      * Every table here carries `force row level security`, which subjects the schema's **owner** to
-     * its policies as well — so the per-workspace policy alone left `select … from workspaces` with
-     * no `app.workspace_id` answering zero rows for everybody but a superuser. That is silent: both
-     * nightly sweeps simply found nothing to do. The second policy is what admits the scheduler, and
-     * `inventory.int.test.ts` proves it against a plain login role; this proves it survives a replay.
+     * its policies as well — so the per-workspace policy alone left `select … from workspaces`
+     * answering zero rows to a sweep for everybody but a superuser. That is silent: both nightly
+     * sweeps simply found nothing to do. `inventory.int.test.ts` proves the read works against a
+     * plain login role; this proves the policies survive a replay.
+     *
+     * **Three, and the middle one is deliberately redundant.** `workspaces_all_read` admits the
+     * `'*'` binding `activeWorkspaces` takes; `workspaces_unbound_read` admits a session with
+     * nothing bound, which is how 0.5.3 enumerated this table, and it stays until no such image can
+     * still be running — a rolling deploy runs two adjacent releases against one schema on purpose.
+     * `0010_workspace_registry_all_binding.sql` says which release may drop it. When it goes, this
+     * expectation loses its middle line and nothing else changes.
      */
     const { rows } = await db.query<{ policyname: string; cmd: string }>(
       `select policyname, cmd from pg_policies
@@ -254,6 +261,7 @@ describe('the migration folder', () => {
         order by policyname`,
     )
     expect(rows.map((r) => `${r.policyname}:${r.cmd}`)).toEqual([
+      'workspaces_all_read:SELECT',
       'workspaces_unbound_read:SELECT',
       'workspaces_ws_isolation:ALL',
     ])
