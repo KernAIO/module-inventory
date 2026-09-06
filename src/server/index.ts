@@ -15,6 +15,7 @@ import {
   inventoryPermissions,
   MODULE_ID,
 } from '../contract/index.js'
+import { seedInventoryDemo } from './demo.js'
 import { inventoryJobs } from './jobs.js'
 import { defineModule, defineServerModule, inventoryRouter, packageVersion } from './router.js'
 import { assets, categories, schema, workspaces } from './schema.js'
@@ -84,6 +85,8 @@ export const inventoryModule = defineServerModule({
   router: inventoryRouter,
 
   jobs: inventoryJobs(),
+
+  demo: { seed: seedInventoryDemo },
 
   /**
    * `inventory:asset:<id>` rendered wherever it is mentioned — a chat message, a tracker issue, a
