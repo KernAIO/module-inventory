@@ -28,11 +28,11 @@
 --
 -- ## Why the old policy is still here
 --
--- 0.5.3 is published and app.kernaio.com runs it. A rolling deploy runs both images against one
--- schema on purpose, and the 0.5.3 image enumerates this table **unbound** — so dropping
--- `workspaces_unbound_read` in this migration would give that image zero rows back, which is
--- precisely the silent do-nothing sweep `0006` existed to fix. Permissive policies are OR-ed, so
--- both stand and both images work: the old one reads unbound, the new one binds `'*'`.
+-- Every released version before this one enumerates this table **unbound**, and a rolling deploy
+-- runs two adjacent releases against one schema on purpose — so dropping `workspaces_unbound_read`
+-- in this migration would give the image being replaced zero rows back, which is precisely the
+-- silent do-nothing sweep `0006` existed to fix. Permissive policies are OR-ed, so both stand and
+-- both images work: the old one reads unbound, the new one binds `'*'`.
 --
 -- ## Follow-up: drop `workspaces_unbound_read`
 --

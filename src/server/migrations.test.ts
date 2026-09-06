@@ -250,8 +250,9 @@ describe('the migration folder', () => {
      *
      * **Three, and the middle one is deliberately redundant.** `workspaces_all_read` admits the
      * `'*'` binding `activeWorkspaces` takes; `workspaces_unbound_read` admits a session with
-     * nothing bound, which is how 0.5.3 enumerated this table, and it stays until no such image can
-     * still be running — a rolling deploy runs two adjacent releases against one schema on purpose.
+     * nothing bound, which is how every released version before this one enumerated this table, and
+     * it stays until no such image can still be running — a rolling deploy runs two adjacent
+     * releases against one schema on purpose.
      * `0010_workspace_registry_all_binding.sql` says which release may drop it. When it goes, this
      * expectation loses its middle line and nothing else changes.
      */

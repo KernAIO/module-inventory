@@ -59,8 +59,9 @@ const updated = () => ts('updated_at').notNull().defaultNow()
  * module's own bookkeeping, not tenant data anybody reads.
  *
  * `0006_workspace_registry_read.sql` solved the same problem by admitting a session with **no**
- * workspace bound, and its policy is still in place because 0.5.3 is published and enumerates this
- * table unbound. `0010`'s header says which release may drop it and why not before then.
+ * workspace bound, and its policy is still in place because every released version before this one
+ * enumerates this table unbound. `0010`'s header says which release may drop it and why not before
+ * then.
  */
 export const workspaces = schema.table('workspaces', {
   workspaceId: uuid('workspace_id').primaryKey(),
